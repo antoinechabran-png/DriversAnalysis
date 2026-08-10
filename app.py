@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 from io import BytesIO
 from semopy import Model
 import re
+import os
 from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -16,6 +17,11 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.inspection import permutation_importance
 
 st.set_page_config(page_title="Consumer Driver Analysis Tool", layout="wide")
+
+# Some sandboxed cloud containers report an undetectable CPU count, which makes
+# joblib's own "n_jobs=-1" auto-detect logic crash with a TypeError. Resolving
+# it ourselves with a safe fallback avoids that failure mode everywhere.
+N_JOBS = os.cpu_count() or 1
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -135,6 +141,26 @@ def render_bootstrap_bar(df, value_col, driver_col, direction_col, color_map, ti
         return df
 
 
+def apply_product_filter(base_df, product_col, product_choice):
+    """Narrows base_df to a single product if one was chosen; returns it unchanged
+    for 'All Products', or when no Product ID column has been set in the sidebar."""
+    if product_col != "None" and product_choice != "All Products":
+        return base_df[base_df[product_col].astype(str) == product_choice]
+    return base_df
+
+
+def product_filter_ui(working_df, product_col, key_prefix):
+    """Renders a per-tab 'Run this analysis on: <product>' selector, defaulting to
+    'All Products'. Composes with whatever Step 0 sub-target filter is already
+    applied to working_df. Shows a hint instead of a selector when no Product ID
+    column has been set in the sidebar (Step 1)."""
+    if product_col == "None":
+        st.caption("💡 Select a Product ID column in the sidebar (Step 1) to run this analysis on a single product.")
+        return "All Products"
+    options = ["All Products"] + sorted(working_df[product_col].dropna().astype(str).unique().tolist())
+    return st.selectbox("Run this analysis on:", options, key=f"{key_prefix}_product_filter")
+
+
 @st.cache_data(show_spinner="Fitting Ridge, Lasso, and Random Forest (only reruns when your data or variable selection changes)...")
 def compute_ml_importance(X, y, feature_names):
     """Ridge / Lasso / Random-Forest-permutation driver importance.
@@ -155,7 +181,7 @@ def compute_ml_importance(X, y, feature_names):
         ml_results.append({'Driver': f, 'Method': 'Ridge', 'Importance (%)': v, 'Direction': 'Positive' if raw > 0 else 'Negative'})
 
     # Lasso - parallelized across the alpha path and CV folds
-    lasso = LassoCV(n_alphas=50, cv=5, max_iter=5000, n_jobs=-1).fit(X_scaled, y_scaled)
+    lasso = LassoCV(n_alphas=50, cv=5, max_iter=5000, n_jobs=N_JOBS).fit(X_scaled, y_scaled)
     lasso_imp = np.abs(lasso.coef_)
     lasso_imp_pct = lasso_imp / lasso_imp.sum() * 100 if lasso_imp.sum() > 0 else lasso_imp
     for f, v, raw in zip(feature_names, lasso_imp_pct, lasso.coef_):
@@ -163,11 +189,11 @@ def compute_ml_importance(X, y, feature_names):
         ml_results.append({'Driver': f, 'Method': 'Lasso', 'Importance (%)': v, 'Direction': direction})
 
     # Random Forest + permutation importance - normally the slowest pair. Parallel tree
-    # building/scoring (n_jobs=-1) plus a trimmed tree count and repeat count keep the
+    # building/scoring (n_jobs=N_JOBS) plus a trimmed tree count and repeat count keep the
     # ranking stable while cutting runtime substantially.
-    rf = RandomForestRegressor(n_estimators=300, random_state=42, min_samples_leaf=3, n_jobs=-1)
+    rf = RandomForestRegressor(n_estimators=300, random_state=42, min_samples_leaf=3, n_jobs=N_JOBS)
     rf.fit(X_scaled, y_scaled)
-    perm = permutation_importance(rf, X_scaled, y_scaled, n_repeats=15, random_state=42, scoring='r2', n_jobs=-1)
+    perm = permutation_importance(rf, X_scaled, y_scaled, n_repeats=15, random_state=42, scoring='r2', n_jobs=N_JOBS)
     rf_imp = np.maximum(perm.importances_mean, 0)
     rf_imp_pct = rf_imp / rf_imp.sum() * 100 if rf_imp.sum() > 0 else rf_imp
     corr_directions = X.apply(lambda col: np.sign(np.corrcoef(col, y)[0, 1]))
@@ -222,7 +248,7 @@ if uploaded_file:
         ["None"] + list(working_df.columns)
     )
     product_col = st.sidebar.selectbox(
-        "Product ID (optional — enables Preference Mapping)",
+        "Product ID (optional — enables Preference Mapping & per-tab product filtering)",
         ["None"] + list(working_df.columns)
     )
 
@@ -261,6 +287,8 @@ if uploaded_file:
                 st.markdown(f"- ✅ **{var}** (p-value: {pval:.4f})")
         else:
             st.write("No variables reached significance for this sub-target.")
+        st.caption("This summary reflects the Step 0 sub-target filter only, across all products. "
+                    "Each tab below can be narrowed further to a single product.")
 
         st.divider()
 
@@ -272,57 +300,98 @@ if uploaded_file:
 
                 if analysis == "Linear Regression":
                     st.subheader("Linear Regression (Standardized Coefficients)")
-                    std_coefs = model.params.iloc[1:] * (X.std() / y.std())
-                    reg_df = pd.DataFrame({'Driver': std_coefs.index, 'Impact Score': std_coefs.values}).sort_values(by='Impact Score', ascending=False)
-                    st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score', color_continuous_scale="RdYlGn"), use_container_width=True)
-                    results_to_export["Regression"] = reg_df
+                    product_choice = product_filter_ui(working_df, product_col, "linreg")
+                    tab_df = apply_product_filter(working_df, product_col, product_choice)
+                    tab_data = tab_df[[target] + features].dropna()
+                    tab_X, tab_y = tab_data[features], tab_data[target]
+
+                    if len(tab_data) < len(features) + 2:
+                        st.warning(f"⚠️ Not enough data for '{product_choice}' (N={len(tab_data)}) to run this analysis.")
+                    else:
+                        tab_model = sm.OLS(tab_y, sm.add_constant(tab_X)).fit()
+                        std_coefs = tab_model.params.iloc[1:] * (tab_X.std() / tab_y.std())
+                        reg_df = pd.DataFrame({'Driver': std_coefs.index, 'Impact Score': std_coefs.values}).sort_values(by='Impact Score', ascending=False)
+                        st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score', color_continuous_scale="RdYlGn"), use_container_width=True)
+                        reg_df['Product Filter'] = product_choice
+                        results_to_export["Regression"] = reg_df
 
                 elif analysis == "RWA":
                     st.subheader("Relative Weight Analysis (RWA)")
-                    rwa_df = run_rwa(X, y)
-                    color_map = {'Positive': '#2ca02c', 'Negative': '#d62728', 'Neutral': 'gray'}
-                    rwa_df = render_bootstrap_bar(
-                        rwa_df, 'Weight (%)', 'Driver', 'Direction', color_map,
-                        "RWA Weights", "rwa", X, y,
-                        lambda Xb, yb: run_rwa(Xb, yb).set_index('Driver')['Weight (%)'],
-                        panelist_col, working_df, X.index
-                    )
-                    results_to_export["RWA"] = rwa_df
+                    product_choice = product_filter_ui(working_df, product_col, "rwa")
+                    tab_df = apply_product_filter(working_df, product_col, product_choice)
+                    tab_data = tab_df[[target] + features].dropna()
+                    tab_X, tab_y = tab_data[features], tab_data[target]
+
+                    if len(tab_data) < len(features) + 2:
+                        st.warning(f"⚠️ Not enough data for '{product_choice}' (N={len(tab_data)}) to run this analysis.")
+                    else:
+                        rwa_df = run_rwa(tab_X, tab_y)
+                        color_map = {'Positive': '#2ca02c', 'Negative': '#d62728', 'Neutral': 'gray'}
+                        rwa_df = render_bootstrap_bar(
+                            rwa_df, 'Weight (%)', 'Driver', 'Direction', color_map,
+                            "RWA Weights", "rwa", tab_X, tab_y,
+                            lambda Xb, yb: run_rwa(Xb, yb).set_index('Driver')['Weight (%)'],
+                            panelist_col, tab_df, tab_X.index
+                        )
+                        rwa_df['Product Filter'] = product_choice
+                        results_to_export["RWA"] = rwa_df
 
                 elif analysis == "Shapley Values":
                     st.subheader("Shapley Values (Contribution to R²)")
-                    shap_pct, raw_std_coefs = compute_shapley_like(X, y)
-                    shap_df = pd.DataFrame({
-                        'Driver': features,
-                        'Importance (%)': shap_pct.values,
-                        'Direction': np.where(raw_std_coefs.values > 0, 'Positive', 'Negative')
-                    }).sort_values(by='Importance (%)', ascending=False)
-                    color_map = {'Positive': '#2ca02c', 'Negative': '#d62728'}
-                    shap_df = render_bootstrap_bar(
-                        shap_df, 'Importance (%)', 'Driver', 'Direction', color_map,
-                        "Shapley-style Importance", "shap", X, y,
-                        lambda Xb, yb: compute_shapley_like(Xb, yb)[0],
-                        panelist_col, working_df, X.index
-                    )
-                    results_to_export["Shapley"] = shap_df
+                    product_choice = product_filter_ui(working_df, product_col, "shap")
+                    tab_df = apply_product_filter(working_df, product_col, product_choice)
+                    tab_data = tab_df[[target] + features].dropna()
+                    tab_X, tab_y = tab_data[features], tab_data[target]
+
+                    if len(tab_data) < len(features) + 2:
+                        st.warning(f"⚠️ Not enough data for '{product_choice}' (N={len(tab_data)}) to run this analysis.")
+                    else:
+                        shap_pct, raw_std_coefs = compute_shapley_like(tab_X, tab_y)
+                        shap_df = pd.DataFrame({
+                            'Driver': features,
+                            'Importance (%)': shap_pct.values,
+                            'Direction': np.where(raw_std_coefs.values > 0, 'Positive', 'Negative')
+                        }).sort_values(by='Importance (%)', ascending=False)
+                        color_map = {'Positive': '#2ca02c', 'Negative': '#d62728'}
+                        shap_df = render_bootstrap_bar(
+                            shap_df, 'Importance (%)', 'Driver', 'Direction', color_map,
+                            "Shapley-style Importance", "shap", tab_X, tab_y,
+                            lambda Xb, yb: compute_shapley_like(Xb, yb)[0],
+                            panelist_col, tab_df, tab_X.index
+                        )
+                        shap_df['Product Filter'] = product_choice
+                        results_to_export["Shapley"] = shap_df
 
                 elif analysis == "Penalty Analysis (CATA)":
                     st.subheader("CATA Penalty Analysis")
+                    product_choice = product_filter_ui(working_df, product_col, "cata")
+                    tab_df = apply_product_filter(working_df, product_col, product_choice)
+                    tab_data = tab_df[[target] + features].dropna()
+                    tab_X, tab_y = tab_data[features], tab_data[target]
                     cata_format = st.radio("Data Format", ["0/1", "1/2"], key="cata_radio")
-                    X_cata = X.copy() - 1 if cata_format == "1/2" else X.copy()
-                    pen_list = []
-                    for col in features:
-                        if 0 in X_cata[col].values and 1 in X_cata[col].values:
-                            diff = y[X_cata[col] == 1].mean() - y[X_cata[col] == 0].mean()
-                            pen_list.append({'Attribute': col, 'Mean Difference': diff, '% Checked': (X_cata[col].mean() * 100)})
-                    pen_df = pd.DataFrame(pen_list).sort_values(by='Mean Difference', ascending=False)
-                    if not pen_df.empty:
-                        st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size_max=40), use_container_width=True)
-                        results_to_export["Penalty"] = pen_df
+
+                    if tab_data.empty:
+                        st.warning(f"⚠️ Not enough data for '{product_choice}' to run this analysis.")
+                    else:
+                        X_cata = tab_X.copy() - 1 if cata_format == "1/2" else tab_X.copy()
+                        pen_list = []
+                        for col in features:
+                            if 0 in X_cata[col].values and 1 in X_cata[col].values:
+                                diff = tab_y[X_cata[col] == 1].mean() - tab_y[X_cata[col] == 0].mean()
+                                pen_list.append({'Attribute': col, 'Mean Difference': diff, '% Checked': (X_cata[col].mean() * 100)})
+                        pen_df = pd.DataFrame(pen_list).sort_values(by='Mean Difference', ascending=False)
+                        if not pen_df.empty:
+                            st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size_max=40), use_container_width=True)
+                            pen_df['Product Filter'] = product_choice
+                            results_to_export["Penalty"] = pen_df
+                        else:
+                            st.warning("No attributes look like 0/1 CATA data in this format — check the Data Format setting above.")
 
                 elif analysis == "JAR Penalty Analysis":
                     st.subheader("JAR (Just-About-Right) Penalty Analysis")
                     st.caption("Select the attributes that were measured on a JAR-type scale (Too Weak ↔ Just About Right ↔ Too Strong).")
+                    product_choice = product_filter_ui(working_df, product_col, "jar")
+                    tab_df = apply_product_filter(working_df, product_col, product_choice)
                     jar_attrs = st.multiselect("Select JAR-type Attributes", features, key="jar_attrs")
                     scale_type = st.radio(
                         "JAR Scale Format",
@@ -337,7 +406,7 @@ if uploaded_file:
                     if jar_attrs:
                         jar_results = []
                         for attr in jar_attrs:
-                            vals = working_df[[attr, target]].dropna()
+                            vals = tab_df[[attr, target]].dropna()
                             if "3-point" in scale_type:
                                 weak = vals[vals[attr] == 1]
                                 jar = vals[vals[attr] == 2]
@@ -425,7 +494,7 @@ if uploaded_file:
                                 ))
 
                             fig.update_layout(
-                                title="JAR Penalty Chart — where to focus first",
+                                title=f"JAR Penalty Chart — {product_choice} — where to focus first",
                                 xaxis_title="% of consumers who said this (bigger bubble = more people)",
                                 yaxis_title=f"Impact on {target} (higher = hurts liking more)",
                                 xaxis_range=[0, x_max], yaxis_range=[y_bottom, y_top],
@@ -442,7 +511,7 @@ if uploaded_file:
                                     "- **Color** = how confident we are it's real: red/orange are statistically confirmed, yellow is promising but needs a bigger sample to be sure, gray/green are low priority."
                                 )
 
-                            st.markdown("#### 🔍 What this means for each attribute")
+                            st.markdown(f"#### 🔍 What this means for each attribute — {product_choice}")
                             for _, row in jar_df.iterrows():
                                 direction_phrase = "too weak" if row['Direction'] == 'Too Weak' else "too strong"
                                 pct, pval = row['% Selecting'], row['p-value']
@@ -464,115 +533,153 @@ if uploaded_file:
                             with st.expander("📋 Full statistical detail"):
                                 st.dataframe(jar_df.style.format({'% Selecting': '{:.1f}', 'Impact on Liking': '{:.3f}', 'p-value': '{:.4f}'}))
 
+                            jar_df['Product Filter'] = product_choice
                             results_to_export["JAR_Penalty"] = jar_df
                         else:
-                            st.warning("Not enough data in the JAR categories to compute penalties.")
+                            st.warning(f"Not enough data for '{product_choice}' in the JAR categories to compute penalties.")
                     else:
                         st.info("Select at least one JAR-type attribute above to run this analysis.")
 
                 elif analysis == "Kano Analysis":
                     st.subheader("Kano Strategic Classification")
-                    kano_list = []
-                    for col in features:
-                        reward = y[X[col] >= X[col].median()].mean() - y.mean()
-                        penalty = y.mean() - y[X[col] < X[col].median()].mean()
+                    product_choice = product_filter_ui(working_df, product_col, "kano")
+                    tab_df = apply_product_filter(working_df, product_col, product_choice)
+                    tab_data = tab_df[[target] + features].dropna()
+                    tab_X, tab_y = tab_data[features], tab_data[target]
 
-                        if reward > penalty and reward > 0.1:
-                            cat = "Delighter (Attractive)"
-                        elif penalty > reward and penalty > 0.1:
-                            cat = "Must-have (Basic)"
-                        elif abs(reward - penalty) < 0.1 and reward > 0.1:
-                            cat = "Linear (Performance)"
-                        else:
-                            cat = "Indifferent"
+                    if tab_data.empty:
+                        st.warning(f"⚠️ Not enough data for '{product_choice}' to run this analysis.")
+                    else:
+                        kano_list = []
+                        for col in features:
+                            reward = tab_y[tab_X[col] >= tab_X[col].median()].mean() - tab_y.mean()
+                            penalty = tab_y.mean() - tab_y[tab_X[col] < tab_X[col].median()].mean()
 
-                        kano_list.append({'Driver': col, 'Reward Potential': reward, 'Penalty Potential': penalty, 'Category': cat})
+                            if reward > penalty and reward > 0.1:
+                                cat = "Delighter (Attractive)"
+                            elif penalty > reward and penalty > 0.1:
+                                cat = "Must-have (Basic)"
+                            elif abs(reward - penalty) < 0.1 and reward > 0.1:
+                                cat = "Linear (Performance)"
+                            else:
+                                cat = "Indifferent"
 
-                    kano_df = pd.DataFrame(kano_list)
-                    st.plotly_chart(px.scatter(kano_df, x='Penalty Potential', y='Reward Potential', color='Category', text='Driver', title="Kano Map"), use_container_width=True)
-                    st.caption("Note: this is a proxy classification based on a median split of each driver, not the full Kano method (which requires paired functional/dysfunctional questions).")
-                    st.table(kano_df)
-                    results_to_export["Kano"] = kano_df
+                            kano_list.append({'Driver': col, 'Reward Potential': reward, 'Penalty Potential': penalty, 'Category': cat})
+
+                        kano_df = pd.DataFrame(kano_list)
+                        st.plotly_chart(px.scatter(kano_df, x='Penalty Potential', y='Reward Potential', color='Category', text='Driver', title=f"Kano Map — {product_choice}"), use_container_width=True)
+                        st.caption("Note: this is a proxy classification based on a median split of each driver, not the full Kano method (which requires paired functional/dysfunctional questions).")
+                        st.table(kano_df)
+                        kano_df['Product Filter'] = product_choice
+                        results_to_export["Kano"] = kano_df
 
                 elif analysis == "Path Analysis":
                     st.subheader("Path Analysis (SEM)")
-                    path_syntax = st.text_area("Syntax", value=f"{target} ~ {' + '.join(features)}")
+                    product_choice = product_filter_ui(working_df, product_col, "path")
+                    tab_df = apply_product_filter(working_df, product_col, product_choice)
+                    tab_data = tab_df[[target] + features].dropna()
+                    path_syntax = st.text_area("Syntax", value=f"{target} ~ {' + '.join(features)}", key="path_syntax")
                     if st.button("Run Path Model"):
-                        try:
-                            sem = Model(path_syntax)
-                            sem.fit(data)
-                            res = sem.inspect()
-                            paths = res[res['op'] == '~']
-                            labels = list(set(paths['lval'].tolist() + paths['rval'].tolist()))
-                            fig = go.Figure(data=[go.Sankey(
-                                node=dict(pad=15, thickness=20, label=labels, color="blue"),
-                                link=dict(source=[labels.index(x) for x in paths['rval']],
-                                          target=[labels.index(x) for x in paths['lval']],
-                                          value=np.abs(paths['Estimate']).tolist(),
-                                          label=paths['Estimate'].round(3).astype(str).tolist()))])
-                            st.plotly_chart(fig, use_container_width=True)
-                            results_to_export["Path"] = res
-                        except Exception as e:
-                            st.error(f"SEM Error: {e}")
+                        if tab_data.empty:
+                            st.warning(f"⚠️ Not enough data for '{product_choice}' to run this analysis.")
+                        else:
+                            try:
+                                sem = Model(path_syntax)
+                                sem.fit(tab_data)
+                                res = sem.inspect()
+                                paths = res[res['op'] == '~']
+                                labels = list(set(paths['lval'].tolist() + paths['rval'].tolist()))
+                                fig = go.Figure(data=[go.Sankey(
+                                    node=dict(pad=15, thickness=20, label=labels, color="blue"),
+                                    link=dict(source=[labels.index(x) for x in paths['rval']],
+                                              target=[labels.index(x) for x in paths['lval']],
+                                              value=np.abs(paths['Estimate']).tolist(),
+                                              label=paths['Estimate'].round(3).astype(str).tolist()))])
+                                st.plotly_chart(fig, use_container_width=True)
+                                res['Product Filter'] = product_choice
+                                results_to_export["Path"] = res
+                            except Exception as e:
+                                st.error(f"SEM Error: {e}")
 
                 elif analysis == "Mixed-Effects Model":
                     st.subheader("Mixed-Effects Model (Random Intercept per Panelist)")
                     st.caption("Accounts for repeated measures — the same consumer rating several fragrances — by giving each panelist their own baseline liking level.")
+                    product_choice = product_filter_ui(working_df, product_col, "mixed")
+                    if product_choice != "All Products":
+                        st.caption("ℹ️ Mixed-effects models rely on the same panelist rating several products. Filtering to a single product "
+                                   "usually leaves only one rating per panelist, which can make the random panelist effect hard to estimate reliably.")
+
                     if panelist_col == "None":
                         st.warning("⚠️ Please select a Panelist ID column in the sidebar (Step 1) to run this analysis.")
                     else:
-                        mm_data = working_df[[target, panelist_col] + features].dropna()
-                        mm_std = mm_data.copy()
-                        mm_std[features] = (mm_data[features] - mm_data[features].mean()) / mm_data[features].std()
-                        mm_std[target] = (mm_data[target] - mm_data[target].mean()) / mm_data[target].std()
+                        tab_df = apply_product_filter(working_df, product_col, product_choice)
+                        mm_data = tab_df[[target, panelist_col] + features].dropna()
 
-                        formula = f"{target} ~ {' + '.join(features)}"
-                        try:
-                            mixed_model = smf.mixedlm(formula, mm_std, groups=mm_std[panelist_col])
-                            mixed_result = mixed_model.fit()
+                        if len(mm_data) < len(features) + 2 or mm_data[panelist_col].nunique() < 2:
+                            st.warning(f"⚠️ Not enough data for '{product_choice}' to fit a mixed model (need ratings from at least 2 panelists).")
+                        else:
+                            mm_std = mm_data.copy()
+                            mm_std[features] = (mm_data[features] - mm_data[features].mean()) / mm_data[features].std()
+                            mm_std[target] = (mm_data[target] - mm_data[target].mean()) / mm_data[target].std()
 
-                            fe = mixed_result.fe_params.drop('Intercept', errors='ignore')
-                            pvals = mixed_result.pvalues
-                            mm_df = pd.DataFrame({
-                                'Driver': fe.index,
-                                'Standardized Coefficient': fe.values,
-                                'p-value': [pvals.get(d, np.nan) for d in fe.index]
-                            }).sort_values(by='Standardized Coefficient', ascending=False)
+                            formula = f"{target} ~ {' + '.join(features)}"
+                            try:
+                                mixed_model = smf.mixedlm(formula, mm_std, groups=mm_std[panelist_col])
+                                mixed_result = mixed_model.fit()
 
-                            st.plotly_chart(px.bar(mm_df, x='Standardized Coefficient', y='Driver', orientation='h',
-                                                    color='Standardized Coefficient', color_continuous_scale="RdYlGn",
-                                                    title="Mixed Model Fixed Effects (Standardized)"), use_container_width=True)
+                                fe = mixed_result.fe_params.drop('Intercept', errors='ignore')
+                                pvals = mixed_result.pvalues
+                                mm_df = pd.DataFrame({
+                                    'Driver': fe.index,
+                                    'Standardized Coefficient': fe.values,
+                                    'p-value': [pvals.get(d, np.nan) for d in fe.index]
+                                }).sort_values(by='Standardized Coefficient', ascending=False)
 
-                            n_panelists = mm_data[panelist_col].nunique()
-                            st.caption(f"Random intercept fit across {n_panelists} panelists ({len(mm_data)} total ratings).")
-                            st.dataframe(mm_df.style.format({'Standardized Coefficient': '{:.4f}', 'p-value': '{:.4f}'}))
+                                st.plotly_chart(px.bar(mm_df, x='Standardized Coefficient', y='Driver', orientation='h',
+                                                        color='Standardized Coefficient', color_continuous_scale="RdYlGn",
+                                                        title=f"Mixed Model Fixed Effects (Standardized) — {product_choice}"), use_container_width=True)
 
-                            with st.expander("Full Model Summary"):
-                                st.text(str(mixed_result.summary()))
+                                n_panelists = mm_data[panelist_col].nunique()
+                                st.caption(f"Random intercept fit across {n_panelists} panelists ({len(mm_data)} total ratings).")
+                                st.dataframe(mm_df.style.format({'Standardized Coefficient': '{:.4f}', 'p-value': '{:.4f}'}))
 
-                            results_to_export["MixedModel"] = mm_df
-                        except Exception as e:
-                            st.error(f"Mixed model failed to converge: {e}")
+                                with st.expander("Full Model Summary"):
+                                    st.text(str(mixed_result.summary()))
+
+                                mm_df['Product Filter'] = product_choice
+                                results_to_export["MixedModel"] = mm_df
+                            except Exception as e:
+                                st.error(f"Mixed model failed to converge: {e}")
 
                 elif analysis == "ML-Based Importance (Ridge/Lasso/RF)":
                     st.subheader("Regularized & ML-Based Importance")
                     st.caption("Compares Ridge, Lasso, and Random Forest (permutation importance) — useful when drivers are highly correlated or effects are non-linear/threshold-based.")
+                    product_choice = product_filter_ui(working_df, product_col, "mlimp")
+                    tab_df = apply_product_filter(working_df, product_col, product_choice)
+                    tab_data = tab_df[[target] + features].dropna()
+                    tab_X, tab_y = tab_data[features], tab_data[target]
 
-                    ml_df, lasso_dropped = compute_ml_importance(X, y, tuple(features))
+                    if len(tab_data) < max(10, len(features) + 5):
+                        st.warning(f"⚠️ Not enough data for '{product_choice}' (N={len(tab_data)}) to fit these models reliably — try 'All Products' or a larger sub-target.")
+                    else:
+                        ml_df, lasso_dropped = compute_ml_importance(tab_X, tab_y, tuple(features))
 
-                    fig = px.bar(ml_df, x='Importance (%)', y='Driver', color='Method', orientation='h', barmode='group',
-                                 title="Driver Importance: Ridge vs Lasso vs Random Forest")
-                    st.plotly_chart(fig, use_container_width=True)
+                        fig = px.bar(ml_df, x='Importance (%)', y='Driver', color='Method', orientation='h', barmode='group',
+                                     title=f"Driver Importance: Ridge vs Lasso vs Random Forest — {product_choice}")
+                        st.plotly_chart(fig, use_container_width=True)
 
-                    if lasso_dropped:
-                        st.info(f"🔎 Lasso shrank these attributes to zero (flagged as not meaningfully contributing once correlation with other attributes is accounted for): {', '.join(lasso_dropped)}")
+                        if lasso_dropped:
+                            st.info(f"🔎 Lasso shrank these attributes to zero (flagged as not meaningfully contributing once correlation with other attributes is accounted for): {', '.join(lasso_dropped)}")
 
-                    st.caption("Random Forest importance is computed via permutation on the training data — treat it as a descriptive ranking rather than an out-of-sample validated result, especially with smaller samples.")
-                    st.dataframe(ml_df.pivot(index='Driver', columns='Method', values='Importance (%)').round(2))
-                    results_to_export["ML_Importance"] = ml_df
+                        st.caption("Random Forest importance is computed via permutation on the training data — treat it as a descriptive ranking rather than an out-of-sample validated result, especially with smaller samples.")
+                        st.dataframe(ml_df.pivot(index='Driver', columns='Method', values='Importance (%)').round(2))
+                        ml_df['Product Filter'] = product_choice
+                        results_to_export["ML_Importance"] = ml_df
 
                 elif analysis == "Preference Mapping":
                     st.subheader("Preference Mapping (PCA + External Vector Model)")
+                    st.caption("This technique compares several products at once, so there's no single-product filter here — "
+                               "it always uses every product available after the Step 0 sub-target filter.")
                     if product_col == "None":
                         st.warning("⚠️ Please select a Product ID column in the sidebar (Step 1) to run Preference Mapping.")
                     elif len(features) < 2:
@@ -643,6 +750,7 @@ if uploaded_file:
         with tabs[-1]:
             st.subheader("Download Results")
             if results_to_export:
+                st.caption("Each sheet includes a 'Product Filter' column showing which product (or 'All Products') that tab was set to when exported.")
                 xlsx_data = to_excel(results_to_export)
                 st.download_button("📥 Download Analysis (.xlsx)", xlsx_data, "subtarget_analysis.xlsx")
             else:
