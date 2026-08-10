@@ -135,6 +135,53 @@ def render_bootstrap_bar(df, value_col, driver_col, direction_col, color_map, ti
         return df
 
 
+@st.cache_data(show_spinner="Fitting Ridge, Lasso, and Random Forest (only reruns when your data or variable selection changes)...")
+def compute_ml_importance(X, y, feature_names):
+    """Ridge / Lasso / Random-Forest-permutation driver importance.
+    Cached so Streamlit doesn't refit these models on every unrelated widget
+    interaction elsewhere in the app - only reruns when X, y, or feature_names change."""
+    feature_names = list(feature_names)
+    scaler = StandardScaler()
+    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=feature_names, index=X.index)
+    y_scaled = (y - y.mean()) / y.std()
+
+    ml_results = []
+
+    # Ridge - closed-form, cheap even with a full alpha grid
+    ridge = RidgeCV(alphas=np.logspace(-3, 3, 30), cv=5).fit(X_scaled, y_scaled)
+    ridge_imp = np.abs(ridge.coef_)
+    ridge_imp_pct = ridge_imp / ridge_imp.sum() * 100 if ridge_imp.sum() > 0 else ridge_imp
+    for f, v, raw in zip(feature_names, ridge_imp_pct, ridge.coef_):
+        ml_results.append({'Driver': f, 'Method': 'Ridge', 'Importance (%)': v, 'Direction': 'Positive' if raw > 0 else 'Negative'})
+
+    # Lasso - parallelized across the alpha path and CV folds
+    lasso = LassoCV(n_alphas=50, cv=5, max_iter=5000, n_jobs=-1).fit(X_scaled, y_scaled)
+    lasso_imp = np.abs(lasso.coef_)
+    lasso_imp_pct = lasso_imp / lasso_imp.sum() * 100 if lasso_imp.sum() > 0 else lasso_imp
+    for f, v, raw in zip(feature_names, lasso_imp_pct, lasso.coef_):
+        direction = 'Positive' if raw > 0 else ('Negative' if raw < 0 else 'Dropped (0)')
+        ml_results.append({'Driver': f, 'Method': 'Lasso', 'Importance (%)': v, 'Direction': direction})
+
+    # Random Forest + permutation importance - normally the slowest pair. Parallel tree
+    # building/scoring (n_jobs=-1) plus a trimmed tree count and repeat count keep the
+    # ranking stable while cutting runtime substantially.
+    rf = RandomForestRegressor(n_estimators=300, random_state=42, min_samples_leaf=3, n_jobs=-1)
+    rf.fit(X_scaled, y_scaled)
+    perm = permutation_importance(rf, X_scaled, y_scaled, n_repeats=15, random_state=42, scoring='r2', n_jobs=-1)
+    rf_imp = np.maximum(perm.importances_mean, 0)
+    rf_imp_pct = rf_imp / rf_imp.sum() * 100 if rf_imp.sum() > 0 else rf_imp
+    corr_directions = X.apply(lambda col: np.sign(np.corrcoef(col, y)[0, 1]))
+    for f, v in zip(feature_names, rf_imp_pct):
+        ml_results.append({
+            'Driver': f, 'Method': 'Random Forest (Permutation)', 'Importance (%)': v,
+            'Direction': {1.0: 'Positive', -1.0: 'Negative', 0.0: 'Neutral'}[corr_directions[f]]
+        })
+
+    ml_df = pd.DataFrame(ml_results)
+    lasso_dropped = [f for f, c in zip(feature_names, lasso.coef_) if c == 0]
+    return ml_df, lasso_dropped
+
+
 # =============================================================================
 # UI APP
 # =============================================================================
@@ -282,6 +329,10 @@ if uploaded_file:
                         ["3-point (1=Too Weak, 2=JAR, 3=Too Strong)", "5-point (1-2=Too Weak, 3=JAR, 4-5=Too Strong)"],
                         key="jar_scale"
                     )
+                    reach_threshold = st.slider(
+                        "What % of consumers counts as \"a lot of people\" for prioritization?",
+                        5, 50, 15, step=5, key="jar_reach"
+                    )
 
                     if jar_attrs:
                         jar_results = []
@@ -315,28 +366,104 @@ if uploaded_file:
 
                             jar_results.append({
                                 'Attribute': attr, 'Direction': 'Too Weak',
-                                '% Selecting': len(weak) / n_total * 100, 'Mean Liking Drop': drop_weak,
+                                '% Selecting': len(weak) / n_total * 100, 'Impact on Liking': drop_weak,
                                 'p-value': p_weak, 'Significant': bool(p_weak < 0.05) if pd.notna(p_weak) else False
                             })
                             jar_results.append({
                                 'Attribute': attr, 'Direction': 'Too Strong',
-                                '% Selecting': len(strong) / n_total * 100, 'Mean Liking Drop': drop_strong,
+                                '% Selecting': len(strong) / n_total * 100, 'Impact on Liking': drop_strong,
                                 'p-value': p_strong, 'Significant': bool(p_strong < 0.05) if pd.notna(p_strong) else False
                             })
 
-                        jar_df = pd.DataFrame(jar_results).dropna(subset=['Mean Liking Drop'])
+                        jar_df = pd.DataFrame(jar_results).dropna(subset=['Impact on Liking'])
                         if not jar_df.empty:
-                            fig = px.scatter(
-                                jar_df, x='% Selecting', y='Mean Liking Drop', color='Direction',
-                                symbol='Significant', text='Attribute',
-                                size=np.abs(jar_df['Mean Liking Drop']) + 1,
-                                color_discrete_map={'Too Weak': '#3498db', 'Too Strong': '#e74c3c'},
-                                title="JAR Penalty Chart (bigger drop + higher % selecting = bigger opportunity)"
+
+                            # --- Plain-language verdict per row ---
+                            def classify(row):
+                                if row['Impact on Liking'] <= 0:
+                                    return "🟢 Not a concern"
+                                elif row['Significant'] and row['% Selecting'] >= reach_threshold:
+                                    return "🔴 Priority fix"
+                                elif row['Significant'] and row['% Selecting'] < reach_threshold:
+                                    return "🟠 Real, but niche"
+                                elif (not row['Significant']) and row['% Selecting'] >= reach_threshold:
+                                    return "🟡 Worth watching"
+                                else:
+                                    return "⚪ Low priority"
+
+                            jar_df['Verdict'] = jar_df.apply(classify, axis=1)
+                            verdict_order = ["🔴 Priority fix", "🟠 Real, but niche", "🟡 Worth watching", "⚪ Low priority", "🟢 Not a concern"]
+                            verdict_colors = {
+                                "🔴 Priority fix": "#e74c3c", "🟠 Real, but niche": "#e67e22",
+                                "🟡 Worth watching": "#f1c40f", "⚪ Low priority": "#bdc3c7",
+                                "🟢 Not a concern": "#2ecc71"
+                            }
+                            jar_df['Verdict'] = pd.Categorical(jar_df['Verdict'], categories=verdict_order, ordered=True)
+                            jar_df = jar_df.sort_values(['Verdict', '% Selecting'], ascending=[True, False]).reset_index(drop=True)
+
+                            # --- Chart: bubble size = % affected, color = confidence/priority ---
+                            x_max = max(jar_df['% Selecting'].max() * 1.15, reach_threshold * 1.5, 10)
+                            y_top = max(jar_df['Impact on Liking'].max() * 1.2, 5)
+                            y_bottom = min(jar_df['Impact on Liking'].min() * 1.2, -5)
+
+                            fig = go.Figure()
+                            fig.add_shape(type="rect", x0=reach_threshold, x1=x_max, y0=0, y1=y_top,
+                                          fillcolor="rgba(231,76,60,0.08)", line_width=0, layer="below")
+                            fig.add_hline(y=0, line_dash="dash", line_color="gray")
+                            fig.add_vline(x=reach_threshold, line_dash="dash", line_color="gray")
+
+                            for verdict in verdict_order:
+                                sub = jar_df[jar_df['Verdict'] == verdict]
+                                if sub.empty:
+                                    continue
+                                fig.add_trace(go.Scatter(
+                                    x=sub['% Selecting'], y=sub['Impact on Liking'], mode='markers+text',
+                                    text=sub['Attribute'] + " (" + sub['Direction'].astype(str) + ")",
+                                    textposition='top center',
+                                    marker=dict(size=(10 + sub['% Selecting'] * 0.6).clip(upper=45), color=verdict_colors[verdict]),
+                                    name=verdict
+                                ))
+
+                            fig.update_layout(
+                                title="JAR Penalty Chart — where to focus first",
+                                xaxis_title="% of consumers who said this (bigger bubble = more people)",
+                                yaxis_title=f"Impact on {target} (higher = hurts liking more)",
+                                xaxis_range=[0, x_max], yaxis_range=[y_bottom, y_top],
+                                height=550
                             )
-                            fig.update_traces(textposition='top center')
                             st.plotly_chart(fig, use_container_width=True)
-                            st.caption("Filled markers (Significant=True) indicate the liking drop vs. JAR is statistically significant (p<0.05, Welch's t-test).")
-                            st.dataframe(jar_df.style.format({'% Selecting': '{:.1f}', 'Mean Liking Drop': '{:.3f}', 'p-value': '{:.4f}'}))
+
+                            with st.expander("❓ How to read this chart"):
+                                st.markdown(
+                                    "- **Each dot** = one attribute in one direction (e.g. *too strong*).\n"
+                                    "- **Further right** = more consumers said this; **bigger bubble** = the same thing, visually.\n"
+                                    "- **Higher up** = the more it drags liking scores down; below the dashed line means that group actually liked it just as much or more.\n"
+                                    "- **Shaded red zone** (top-right) = affects a lot of people *and* hurts liking — your best candidates to act on.\n"
+                                    "- **Color** = how confident we are it's real: red/orange are statistically confirmed, yellow is promising but needs a bigger sample to be sure, gray/green are low priority."
+                                )
+
+                            st.markdown("#### 🔍 What this means for each attribute")
+                            for _, row in jar_df.iterrows():
+                                direction_phrase = "too weak" if row['Direction'] == 'Too Weak' else "too strong"
+                                pct, pval = row['% Selecting'], row['p-value']
+                                if row['Verdict'] == "🔴 Priority fix":
+                                    txt = (f"significantly pulls down {target} (p={pval:.3f}). "
+                                           f"This is your clearest, most confident opportunity to act on.")
+                                elif row['Verdict'] == "🟠 Real, but niche":
+                                    txt = (f"the effect is statistically real (p={pval:.3f}), but it only affects a small "
+                                           f"share of consumers — lower priority unless that group matters strategically.")
+                                elif row['Verdict'] == "🟡 Worth watching":
+                                    txt = (f"liking looks lower for this group, but with the current sample it isn't "
+                                           f"statistically confirmed yet (p={pval:.3f}). Worth a bigger sample or a follow-up test before reformulating.")
+                                elif row['Verdict'] == "⚪ Low priority":
+                                    txt = f"it's a small group and not statistically confirmed (p={pval:.3f}) — safe to deprioritize."
+                                else:
+                                    txt = "this group doesn't actually like the product any less for it — no action needed."
+                                st.markdown(f"{row['Verdict']} **{row['Attribute']} — {row['Direction']}**: {pct:.0f}% of consumers say it's {direction_phrase}, and {txt}")
+
+                            with st.expander("📋 Full statistical detail"):
+                                st.dataframe(jar_df.style.format({'% Selecting': '{:.1f}', 'Impact on Liking': '{:.3f}', 'p-value': '{:.4f}'}))
+
                             results_to_export["JAR_Penalty"] = jar_df
                         else:
                             st.warning("Not enough data in the JAR categories to compute penalties.")
@@ -431,47 +558,12 @@ if uploaded_file:
                     st.subheader("Regularized & ML-Based Importance")
                     st.caption("Compares Ridge, Lasso, and Random Forest (permutation importance) — useful when drivers are highly correlated or effects are non-linear/threshold-based.")
 
-                    scaler = StandardScaler()
-                    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=features, index=X.index)
-                    y_scaled = (y - y.mean()) / y.std()
-
-                    ml_results = []
-
-                    # Ridge
-                    ridge = RidgeCV(alphas=np.logspace(-3, 3, 50), cv=5).fit(X_scaled, y_scaled)
-                    ridge_imp = np.abs(ridge.coef_)
-                    ridge_imp_pct = ridge_imp / ridge_imp.sum() * 100 if ridge_imp.sum() > 0 else ridge_imp
-                    for f, v, raw in zip(features, ridge_imp_pct, ridge.coef_):
-                        ml_results.append({'Driver': f, 'Method': 'Ridge', 'Importance (%)': v, 'Direction': 'Positive' if raw > 0 else 'Negative'})
-
-                    # Lasso
-                    lasso = LassoCV(cv=5, max_iter=10000).fit(X_scaled, y_scaled)
-                    lasso_imp = np.abs(lasso.coef_)
-                    lasso_imp_pct = lasso_imp / lasso_imp.sum() * 100 if lasso_imp.sum() > 0 else lasso_imp
-                    for f, v, raw in zip(features, lasso_imp_pct, lasso.coef_):
-                        direction = 'Positive' if raw > 0 else ('Negative' if raw < 0 else 'Dropped (0)')
-                        ml_results.append({'Driver': f, 'Method': 'Lasso', 'Importance (%)': v, 'Direction': direction})
-
-                    # Random Forest + permutation importance
-                    rf = RandomForestRegressor(n_estimators=500, random_state=42, min_samples_leaf=3)
-                    rf.fit(X_scaled, y_scaled)
-                    perm = permutation_importance(rf, X_scaled, y_scaled, n_repeats=30, random_state=42, scoring='r2')
-                    rf_imp = np.maximum(perm.importances_mean, 0)
-                    rf_imp_pct = rf_imp / rf_imp.sum() * 100 if rf_imp.sum() > 0 else rf_imp
-                    corr_directions = X.apply(lambda col: np.sign(np.corrcoef(col, y)[0, 1]))
-                    for f, v in zip(features, rf_imp_pct):
-                        ml_results.append({
-                            'Driver': f, 'Method': 'Random Forest (Permutation)', 'Importance (%)': v,
-                            'Direction': {1.0: 'Positive', -1.0: 'Negative', 0.0: 'Neutral'}[corr_directions[f]]
-                        })
-
-                    ml_df = pd.DataFrame(ml_results)
+                    ml_df, lasso_dropped = compute_ml_importance(X, y, tuple(features))
 
                     fig = px.bar(ml_df, x='Importance (%)', y='Driver', color='Method', orientation='h', barmode='group',
                                  title="Driver Importance: Ridge vs Lasso vs Random Forest")
                     st.plotly_chart(fig, use_container_width=True)
 
-                    lasso_dropped = [f for f, c in zip(features, lasso.coef_) if c == 0]
                     if lasso_dropped:
                         st.info(f"🔎 Lasso shrank these attributes to zero (flagged as not meaningfully contributing once correlation with other attributes is accounted for): {', '.join(lasso_dropped)}")
 
@@ -504,8 +596,11 @@ if uploaded_file:
                             loadings_df = pd.DataFrame(loadings, columns=['PC1', 'PC2'], index=features)
 
                             # External preference vector: regress mean liking per product on PC scores
-                            pref_model = sm.OLS(liking_means.values, sm.add_constant(scores_df.values)).fit()
-                            vec_pc1, vec_pc2 = pref_model.params.iloc[1], pref_model.params.iloc[2]
+                            # (pass pandas objects, not .values, so .params comes back as a labeled
+                            # Series with .loc access rather than a bare numpy array)
+                            pref_exog = sm.add_constant(scores_df, has_constant='add')
+                            pref_model = sm.OLS(liking_means, pref_exog).fit()
+                            vec_pc1, vec_pc2 = pref_model.params.loc['PC1'], pref_model.params.loc['PC2']
 
                             fig = go.Figure()
                             fig.add_trace(go.Scatter(
