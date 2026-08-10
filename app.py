@@ -11,20 +11,9 @@ import re
 from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import RidgeCV, LassoCV
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.inspection import permutation_importance
 
 st.set_page_config(page_title="Consumer Driver Analysis Tool", layout="wide")
 
-# NOTE ON PARALLELISM: RidgeCV/LassoCV/RandomForest/permutation_importance can all use
-# joblib to fit across multiple CPU cores at once (n_jobs > 1). We tried that, including
-# a "safe" auto-detected core count, but it still crashed with a TypeError on this app's
-# hosting environment (Streamlit Cloud + Python 3.14) - the issue is joblib's parallel
-# backend itself on that combination, not the core-count number we passed it. So every
-# fit below runs single-threaded (n_jobs=1) on purpose. It's slightly slower per fit, but
-# the st.cache_data on compute_ml_importance means it only reruns when your data or
-# variable selection actually changes, which is the bigger lever for responsiveness anyway.
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -167,52 +156,6 @@ def product_filter_ui(working_df, product_col, key_prefix):
     return st.selectbox("Run this analysis on:", options, key=f"{key_prefix}_product_filter")
 
 
-@st.cache_data(show_spinner="Fitting Ridge, Lasso, and Random Forest (only reruns when your data or variable selection changes)...")
-def compute_ml_importance(X, y, feature_names):
-    """Ridge / Lasso / Random-Forest-permutation driver importance.
-    Cached so Streamlit doesn't refit these models on every unrelated widget
-    interaction elsewhere in the app - only reruns when X, y, or feature_names change."""
-    feature_names = list(feature_names)
-    scaler = StandardScaler()
-    X_scaled = pd.DataFrame(scaler.fit_transform(X), columns=feature_names, index=X.index)
-    y_scaled = (y - y.mean()) / y.std()
-
-    ml_results = []
-
-    # Ridge - closed-form, cheap even with a full alpha grid
-    ridge = RidgeCV(alphas=np.logspace(-3, 3, 30), cv=5).fit(X_scaled, y_scaled)
-    ridge_imp = np.abs(ridge.coef_)
-    ridge_imp_pct = ridge_imp / ridge_imp.sum() * 100 if ridge_imp.sum() > 0 else ridge_imp
-    for f, v, raw in zip(feature_names, ridge_imp_pct, ridge.coef_):
-        ml_results.append({'Driver': f, 'Method': 'Ridge', 'Importance (%)': v, 'Direction': 'Positive' if raw > 0 else 'Negative'})
-
-    # Lasso - parallelized across the alpha path and CV folds
-    lasso = LassoCV(n_alphas=50, cv=5, max_iter=5000, n_jobs=1).fit(X_scaled, y_scaled)
-    lasso_imp = np.abs(lasso.coef_)
-    lasso_imp_pct = lasso_imp / lasso_imp.sum() * 100 if lasso_imp.sum() > 0 else lasso_imp
-    for f, v, raw in zip(feature_names, lasso_imp_pct, lasso.coef_):
-        direction = 'Positive' if raw > 0 else ('Negative' if raw < 0 else 'Dropped (0)')
-        ml_results.append({'Driver': f, 'Method': 'Lasso', 'Importance (%)': v, 'Direction': direction})
-
-    # Random Forest + permutation importance. Single-threaded on purpose (see note at
-    # top of file re: joblib parallelism crashing on this hosting environment).
-    rf = RandomForestRegressor(n_estimators=300, random_state=42, min_samples_leaf=3, n_jobs=1)
-    rf.fit(X_scaled, y_scaled)
-    perm = permutation_importance(rf, X_scaled, y_scaled, n_repeats=15, random_state=42, scoring='r2', n_jobs=1)
-    rf_imp = np.maximum(perm.importances_mean, 0)
-    rf_imp_pct = rf_imp / rf_imp.sum() * 100 if rf_imp.sum() > 0 else rf_imp
-    corr_directions = X.apply(lambda col: np.sign(np.corrcoef(col, y)[0, 1]))
-    for f, v in zip(feature_names, rf_imp_pct):
-        ml_results.append({
-            'Driver': f, 'Method': 'Random Forest (Permutation)', 'Importance (%)': v,
-            'Direction': {1.0: 'Positive', -1.0: 'Negative', 0.0: 'Neutral'}[corr_directions[f]]
-        })
-
-    ml_df = pd.DataFrame(ml_results)
-    lasso_dropped = [f for f, c in zip(feature_names, lasso.coef_) if c == 0]
-    return ml_df, lasso_dropped
-
-
 # =============================================================================
 # UI APP
 # =============================================================================
@@ -277,7 +220,7 @@ if uploaded_file:
     analysis_options = [
         "Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)",
         "JAR Penalty Analysis", "Kano Analysis", "Path Analysis",
-        "Mixed-Effects Model", "ML-Based Importance (Ridge/Lasso/RF)", "Preference Mapping"
+        "Mixed-Effects Model", "Preference Mapping"
     ]
     analysis_types = st.sidebar.multiselect("Choose Analyses", analysis_options, default=[], placeholder="Choose options...")
 
@@ -373,11 +316,18 @@ if uploaded_file:
 
                 elif analysis == "Penalty Analysis (CATA)":
                     st.subheader("CATA Penalty Analysis")
+                    st.caption("Clusters each attribute by how often consumers check it (reach) and whether checking it "
+                               "significantly moves liking up or down (impact) — e.g. a 'Must-Have' is highly checked "
+                               "with a confirmed positive impact.")
                     product_choice = product_filter_ui(working_df, product_col, "cata")
                     tab_df = apply_product_filter(working_df, product_col, product_choice)
                     tab_data = tab_df[[target] + features].dropna()
                     tab_X, tab_y = tab_data[features], tab_data[target]
                     cata_format = st.radio("Data Format", ["0/1", "1/2"], key="cata_radio")
+                    reach_threshold_cata = st.slider(
+                        "What % checked counts as \"highly checked\" (high reach)?",
+                        5, 50, 20, step=5, key="cata_reach"
+                    )
 
                     if tab_data.empty:
                         st.warning(f"⚠️ Not enough data for '{product_choice}' to run this analysis.")
@@ -386,15 +336,114 @@ if uploaded_file:
                         pen_list = []
                         for col in features:
                             if 0 in X_cata[col].values and 1 in X_cata[col].values:
-                                diff = tab_y[X_cata[col] == 1].mean() - tab_y[X_cata[col] == 0].mean()
-                                pen_list.append({'Attribute': col, 'Mean Difference': diff, '% Checked': (X_cata[col].mean() * 100)})
-                        pen_df = pd.DataFrame(pen_list).sort_values(by='Mean Difference', ascending=False)
-                        if not pen_df.empty:
-                            st.plotly_chart(px.scatter(pen_df, x='% Checked', y='Mean Difference', text='Attribute', size_max=40), use_container_width=True)
+                                checked = tab_y[X_cata[col] == 1]
+                                unchecked = tab_y[X_cata[col] == 0]
+                                diff = checked.mean() - unchecked.mean()
+                                if len(checked) > 1 and len(unchecked) > 1:
+                                    pval = stats.ttest_ind(checked, unchecked, equal_var=False).pvalue
+                                else:
+                                    pval = np.nan
+                                pen_list.append({
+                                    'Attribute': col, 'Impact on Liking': diff,
+                                    '% Checked': (X_cata[col].mean() * 100),
+                                    'p-value': pval, 'Significant': bool(pval < 0.05) if pd.notna(pval) else False
+                                })
+                        pen_df = pd.DataFrame(pen_list)
+
+                        if pen_df.empty:
+                            st.warning("No attributes look like 0/1 CATA data in this format — check the Data Format setting above.")
+                        else:
+                            # --- Cluster into a 2 (reach) x 3 (impact, significance-informed) grid ---
+                            def classify_cata(row):
+                                high_reach = row['% Checked'] >= reach_threshold_cata
+                                if row['Significant'] and row['Impact on Liking'] > 0:
+                                    return "🟢 Must-Have (Core Strength)" if high_reach else "🔵 Hidden Gem (Opportunity)"
+                                elif row['Significant'] and row['Impact on Liking'] < 0:
+                                    return "🔴 Red Flag (Liability)" if high_reach else "🟠 Latent Risk (Watch)"
+                                else:
+                                    return "⚪ Table Stakes (Expected)" if high_reach else "🟣 Low Priority (Unconfirmed)"
+
+                            pen_df['Segment'] = pen_df.apply(classify_cata, axis=1)
+                            segment_order = [
+                                "🟢 Must-Have (Core Strength)", "🔵 Hidden Gem (Opportunity)",
+                                "🔴 Red Flag (Liability)", "🟠 Latent Risk (Watch)",
+                                "⚪ Table Stakes (Expected)", "🟣 Low Priority (Unconfirmed)"
+                            ]
+                            segment_colors = {
+                                "🟢 Must-Have (Core Strength)": "#2ecc71", "🔵 Hidden Gem (Opportunity)": "#3498db",
+                                "🔴 Red Flag (Liability)": "#e74c3c", "🟠 Latent Risk (Watch)": "#e67e22",
+                                "⚪ Table Stakes (Expected)": "#95a5a6", "🟣 Low Priority (Unconfirmed)": "#9b59b6"
+                            }
+                            pen_df['Segment'] = pd.Categorical(pen_df['Segment'], categories=segment_order, ordered=True)
+                            pen_df = pen_df.sort_values(['Segment', '% Checked'], ascending=[True, False]).reset_index(drop=True)
+
+                            # --- Quadrant chart: bubble size = % checked, color = segment ---
+                            x_max = max(pen_df['% Checked'].max() * 1.15, reach_threshold_cata * 1.5, 10)
+                            y_top = max(pen_df['Impact on Liking'].max() * 1.2, 1)
+                            y_bottom = min(pen_df['Impact on Liking'].min() * 1.2, -1)
+
+                            fig = go.Figure()
+                            fig.add_hline(y=0, line_dash="dash", line_color="gray")
+                            fig.add_vline(x=reach_threshold_cata, line_dash="dash", line_color="gray")
+
+                            for seg in segment_order:
+                                sub = pen_df[pen_df['Segment'] == seg]
+                                if sub.empty:
+                                    continue
+                                fig.add_trace(go.Scatter(
+                                    x=sub['% Checked'], y=sub['Impact on Liking'], mode='markers+text',
+                                    text=sub['Attribute'], textposition='top center',
+                                    marker=dict(size=(10 + sub['% Checked'] * 0.6).clip(upper=45), color=segment_colors[seg]),
+                                    name=seg
+                                ))
+
+                            fig.update_layout(
+                                title=f"CATA Penalty Map — {product_choice}",
+                                xaxis_title="% of consumers who checked this attribute (bigger bubble = more people)",
+                                yaxis_title=f"Impact on {target} (checked vs. not checked)",
+                                xaxis_range=[0, x_max], yaxis_range=[y_bottom, y_top],
+                                height=550
+                            )
+                            st.plotly_chart(fig, use_container_width=True)
+
+                            with st.expander("❓ How to read this chart"):
+                                st.markdown(
+                                    "- **Each dot** = one attribute from your CATA list.\n"
+                                    "- **Further right** = more consumers checked it; **bigger bubble** = the same thing, visually.\n"
+                                    "- **Higher up** = liking is higher when consumers check it; below the dashed line means checking it goes with *lower* liking.\n"
+                                    "- **Color = segment**, based on reach (left/right of the vertical dashed line) and whether the "
+                                    "liking difference is statistically confirmed:\n"
+                                    "  - 🟢 **Must-Have**: highly checked, confirmed positive impact — your core strengths, protect these.\n"
+                                    "  - 🔵 **Hidden Gem**: not widely checked yet, but confirmed positive impact when it is — an opportunity to make it more noticeable.\n"
+                                    "  - 🔴 **Red Flag**: highly checked, confirmed negative impact — your biggest liability, fix first.\n"
+                                    "  - 🟠 **Latent Risk**: not widely checked yet, but confirmed negative impact when it is — worth watching in case reach grows.\n"
+                                    "  - ⚪ **Table Stakes**: highly checked, but no confirmed effect on liking — expected/assumed, not a differentiator.\n"
+                                    "  - 🟣 **Low Priority**: rarely checked and no confirmed effect — safe to deprioritize."
+                                )
+
+                            st.markdown(f"#### 🔍 What this means for each attribute — {product_choice}")
+                            for _, row in pen_df.iterrows():
+                                pct, pval, seg = row['% Checked'], row['p-value'], row['Segment']
+                                pval_txt = f"p={pval:.3f}" if pd.notna(pval) else "p=n/a (too few respondents in one group)"
+                                if seg == "🟢 Must-Have (Core Strength)":
+                                    txt = f"significantly boosts {target} when checked ({pval_txt}). Protect and reinforce this — it's a core strength."
+                                elif seg == "🔵 Hidden Gem (Opportunity)":
+                                    txt = f"significantly boosts {target} when checked ({pval_txt}), but few consumers notice it yet. Consider making it more salient (formulation intensity, packaging cues, communication)."
+                                elif seg == "🔴 Red Flag (Liability)":
+                                    txt = f"significantly hurts {target} when checked ({pval_txt}), and a lot of people notice it. This is your clearest priority to fix."
+                                elif seg == "🟠 Latent Risk (Watch)":
+                                    txt = f"significantly hurts {target} when checked ({pval_txt}), but only a small group notices it today. Lower priority, but worth monitoring."
+                                elif seg == "⚪ Table Stakes (Expected)":
+                                    txt = f"widely checked, but doesn't move {target} either way ({pval_txt}). It's expected/assumed rather than a differentiator."
+                                else:
+                                    txt = f"rarely checked and no confirmed effect on {target} ({pval_txt}). Safe to deprioritize."
+                                st.markdown(f"{seg} **{row['Attribute']}**: {pct:.0f}% of consumers checked it, and it {txt}")
+
+                            with st.expander("📋 Full statistical detail"):
+                                st.dataframe(pen_df.style.format({'% Checked': '{:.1f}', 'Impact on Liking': '{:.3f}', 'p-value': '{:.4f}'}))
+
                             pen_df['Product Filter'] = product_choice
                             results_to_export["Penalty"] = pen_df
-                        else:
-                            st.warning("No attributes look like 0/1 CATA data in this format — check the Data Format setting above.")
 
                 elif analysis == "JAR Penalty Analysis":
                     st.subheader("JAR (Just-About-Right) Penalty Analysis")
@@ -659,31 +708,6 @@ if uploaded_file:
                                 results_to_export["MixedModel"] = mm_df
                             except Exception as e:
                                 st.error(f"Mixed model failed to converge: {e}")
-
-                elif analysis == "ML-Based Importance (Ridge/Lasso/RF)":
-                    st.subheader("Regularized & ML-Based Importance")
-                    st.caption("Compares Ridge, Lasso, and Random Forest (permutation importance) — useful when drivers are highly correlated or effects are non-linear/threshold-based.")
-                    product_choice = product_filter_ui(working_df, product_col, "mlimp")
-                    tab_df = apply_product_filter(working_df, product_col, product_choice)
-                    tab_data = tab_df[[target] + features].dropna()
-                    tab_X, tab_y = tab_data[features], tab_data[target]
-
-                    if len(tab_data) < max(10, len(features) + 5):
-                        st.warning(f"⚠️ Not enough data for '{product_choice}' (N={len(tab_data)}) to fit these models reliably — try 'All Products' or a larger sub-target.")
-                    else:
-                        ml_df, lasso_dropped = compute_ml_importance(tab_X, tab_y, tuple(features))
-
-                        fig = px.bar(ml_df, x='Importance (%)', y='Driver', color='Method', orientation='h', barmode='group',
-                                     title=f"Driver Importance: Ridge vs Lasso vs Random Forest — {product_choice}")
-                        st.plotly_chart(fig, use_container_width=True)
-
-                        if lasso_dropped:
-                            st.info(f"🔎 Lasso shrank these attributes to zero (flagged as not meaningfully contributing once correlation with other attributes is accounted for): {', '.join(lasso_dropped)}")
-
-                        st.caption("Random Forest importance is computed via permutation on the training data — treat it as a descriptive ranking rather than an out-of-sample validated result, especially with smaller samples.")
-                        st.dataframe(ml_df.pivot(index='Driver', columns='Method', values='Importance (%)').round(2))
-                        ml_df['Product Filter'] = product_choice
-                        results_to_export["ML_Importance"] = ml_df
 
                 elif analysis == "Preference Mapping":
                     st.subheader("Preference Mapping (PCA + External Vector Model)")
