@@ -8,7 +8,6 @@ import plotly.graph_objects as go
 from io import BytesIO
 from semopy import Model
 import re
-import os
 from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -18,10 +17,14 @@ from sklearn.inspection import permutation_importance
 
 st.set_page_config(page_title="Consumer Driver Analysis Tool", layout="wide")
 
-# Some sandboxed cloud containers report an undetectable CPU count, which makes
-# joblib's own "n_jobs=-1" auto-detect logic crash with a TypeError. Resolving
-# it ourselves with a safe fallback avoids that failure mode everywhere.
-N_JOBS = os.cpu_count() or 1
+# NOTE ON PARALLELISM: RidgeCV/LassoCV/RandomForest/permutation_importance can all use
+# joblib to fit across multiple CPU cores at once (n_jobs > 1). We tried that, including
+# a "safe" auto-detected core count, but it still crashed with a TypeError on this app's
+# hosting environment (Streamlit Cloud + Python 3.14) - the issue is joblib's parallel
+# backend itself on that combination, not the core-count number we passed it. So every
+# fit below runs single-threaded (n_jobs=1) on purpose. It's slightly slower per fit, but
+# the st.cache_data on compute_ml_importance means it only reruns when your data or
+# variable selection actually changes, which is the bigger lever for responsiveness anyway.
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -152,10 +155,13 @@ def apply_product_filter(base_df, product_col, product_choice):
 def product_filter_ui(working_df, product_col, key_prefix):
     """Renders a per-tab 'Run this analysis on: <product>' selector, defaulting to
     'All Products'. Composes with whatever Step 0 sub-target filter is already
-    applied to working_df. Shows a hint instead of a selector when no Product ID
-    column has been set in the sidebar (Step 1)."""
+    applied to working_df. Shows a prominent warning instead of a selector when no
+    Product ID column has been set in the sidebar (Step 1) - this is deliberately
+    loud (not a subtle caption) because it's easy to miss otherwise."""
     if product_col == "None":
-        st.caption("💡 Select a Product ID column in the sidebar (Step 1) to run this analysis on a single product.")
+        st.warning("⚠️ **Product filtering is off** — go to the sidebar → Step 1 → \"Product ID column\" "
+                   "and pick the column that identifies which product/fragrance each row belongs to. "
+                   "This tab will run on your full sample until you do.")
         return "All Products"
     options = ["All Products"] + sorted(working_df[product_col].dropna().astype(str).unique().tolist())
     return st.selectbox("Run this analysis on:", options, key=f"{key_prefix}_product_filter")
@@ -181,19 +187,18 @@ def compute_ml_importance(X, y, feature_names):
         ml_results.append({'Driver': f, 'Method': 'Ridge', 'Importance (%)': v, 'Direction': 'Positive' if raw > 0 else 'Negative'})
 
     # Lasso - parallelized across the alpha path and CV folds
-    lasso = LassoCV(n_alphas=50, cv=5, max_iter=5000, n_jobs=N_JOBS).fit(X_scaled, y_scaled)
+    lasso = LassoCV(n_alphas=50, cv=5, max_iter=5000, n_jobs=1).fit(X_scaled, y_scaled)
     lasso_imp = np.abs(lasso.coef_)
     lasso_imp_pct = lasso_imp / lasso_imp.sum() * 100 if lasso_imp.sum() > 0 else lasso_imp
     for f, v, raw in zip(feature_names, lasso_imp_pct, lasso.coef_):
         direction = 'Positive' if raw > 0 else ('Negative' if raw < 0 else 'Dropped (0)')
         ml_results.append({'Driver': f, 'Method': 'Lasso', 'Importance (%)': v, 'Direction': direction})
 
-    # Random Forest + permutation importance - normally the slowest pair. Parallel tree
-    # building/scoring (n_jobs=N_JOBS) plus a trimmed tree count and repeat count keep the
-    # ranking stable while cutting runtime substantially.
-    rf = RandomForestRegressor(n_estimators=300, random_state=42, min_samples_leaf=3, n_jobs=N_JOBS)
+    # Random Forest + permutation importance. Single-threaded on purpose (see note at
+    # top of file re: joblib parallelism crashing on this hosting environment).
+    rf = RandomForestRegressor(n_estimators=300, random_state=42, min_samples_leaf=3, n_jobs=1)
     rf.fit(X_scaled, y_scaled)
-    perm = permutation_importance(rf, X_scaled, y_scaled, n_repeats=15, random_state=42, scoring='r2', n_jobs=N_JOBS)
+    perm = permutation_importance(rf, X_scaled, y_scaled, n_repeats=15, random_state=42, scoring='r2', n_jobs=1)
     rf_imp = np.maximum(perm.importances_mean, 0)
     rf_imp_pct = rf_imp / rf_imp.sum() * 100 if rf_imp.sum() > 0 else rf_imp
     corr_directions = X.apply(lambda col: np.sign(np.corrcoef(col, y)[0, 1]))
@@ -248,9 +253,13 @@ if uploaded_file:
         ["None"] + list(working_df.columns)
     )
     product_col = st.sidebar.selectbox(
-        "Product ID (optional — enables Preference Mapping & per-tab product filtering)",
+        "🧴 Product ID column — set this to unlock per-product filtering in EVERY analysis tab below, plus Preference Mapping",
         ["None"] + list(working_df.columns)
     )
+    if product_col == "None":
+        st.sidebar.warning("⚠️ No Product ID column selected — every analysis tab will run on your full sample "
+                            "(no per-product filter will be shown). Pick the column above that identifies which "
+                            "product/fragrance each row belongs to if you want to filter by product.")
 
     st.sidebar.write("Select Explanatory Variables (Drivers / Attributes):")
     available_drivers = [c for c in working_df.columns if c != target]
