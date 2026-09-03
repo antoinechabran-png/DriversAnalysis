@@ -12,6 +12,17 @@ from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
+try:
+    from pptx import Presentation
+    from pptx.util import Inches, Pt, Emu
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+    from pptx.dml.color import RGBColor
+    from pptx.enum.text import PP_ALIGN
+    PPTX_AVAILABLE = True
+except ImportError:
+    PPTX_AVAILABLE = False
+
 st.set_page_config(page_title="Consumer Driver Analysis Tool", layout="wide")
 
 
@@ -141,6 +152,388 @@ def apply_product_filter(base_df, product_col, product_choice):
     return base_df
 
 
+def classify_question(series, colname):
+    """Auto-detects a question's type from its data + name, for the driver picker:
+    - 'Scale' if it has more than 2 distinct answer codes (e.g. a 1-5/1-10 liking/JAR scale)
+    - 'CATA' if it has 2 (or fewer) distinct codes (e.g. a 0/1 or yes/no checked-or-not question)
+    - flagged as a Screener if the column name starts with 'S' followed by a digit (e.g. S1, S2b)
+    """
+    non_null = series.dropna()
+    nunique = non_null.nunique()
+    qtype = "Scale" if nunique > 2 else "CATA"
+    is_screener = bool(re.match(r'^S\d', str(colname).strip(), re.IGNORECASE))
+    return qtype, is_screener, nunique
+
+
+# =============================================================================
+# REUSABLE ANALYSIS CALCULATORS (pure functions, no Streamlit widgets)
+# Used both by the interactive tabs above and by the PowerPoint export below,
+# so a slide's numbers always match what the same analysis would show on-screen.
+# =============================================================================
+
+def calc_linear_regression(tab_df, target, features):
+    tab_data = tab_df[[target] + features].dropna()
+    if len(tab_data) < len(features) + 2:
+        return None
+    tab_X, tab_y = tab_data[features], tab_data[target]
+    tab_model = sm.OLS(tab_y, sm.add_constant(tab_X)).fit()
+    std_coefs = tab_model.params.iloc[1:] * (tab_X.std() / tab_y.std())
+    return pd.DataFrame({'Driver': std_coefs.index, 'Impact Score': std_coefs.values}).sort_values(
+        by='Impact Score', ascending=False)
+
+
+def calc_rwa(tab_df, target, features):
+    tab_data = tab_df[[target] + features].dropna()
+    if len(tab_data) < len(features) + 2:
+        return None
+    return run_rwa(tab_data[features], tab_data[target])
+
+
+def calc_shapley(tab_df, target, features):
+    tab_data = tab_df[[target] + features].dropna()
+    if len(tab_data) < len(features) + 2:
+        return None
+    shap_pct, raw_std_coefs = compute_shapley_like(tab_data[features], tab_data[target])
+    return pd.DataFrame({
+        'Driver': features,
+        'Importance (%)': shap_pct.values,
+        'Direction': np.where(raw_std_coefs.values > 0, 'Positive', 'Negative')
+    }).sort_values(by='Importance (%)', ascending=False)
+
+
+def calc_cata_penalty(tab_df, target, features, cata_format="0/1", reach_threshold=20):
+    tab_data = tab_df[[target] + features].dropna()
+    if tab_data.empty:
+        return None
+    tab_X, tab_y = tab_data[features], tab_data[target]
+    X_cata = tab_X.copy() - 1 if cata_format == "1/2" else tab_X.copy()
+    pen_list = []
+    for col in features:
+        if 0 in X_cata[col].values and 1 in X_cata[col].values:
+            checked = tab_y[X_cata[col] == 1]
+            unchecked = tab_y[X_cata[col] == 0]
+            diff = checked.mean() - unchecked.mean()
+            if len(checked) > 1 and len(unchecked) > 1:
+                pval = stats.ttest_ind(checked, unchecked, equal_var=False).pvalue
+            else:
+                pval = np.nan
+            pen_list.append({
+                'Attribute': col, 'Impact on Liking': diff, '% Checked': X_cata[col].mean() * 100,
+                'p-value': pval, 'Significant': bool(pval < 0.05) if pd.notna(pval) else False
+            })
+    if not pen_list:
+        return None
+    pen_df = pd.DataFrame(pen_list)
+
+    def classify_cata(row):
+        high_reach = row['% Checked'] >= reach_threshold
+        if row['Significant'] and row['Impact on Liking'] > 0:
+            return "Must-Have (Core Strength)" if high_reach else "Hidden Gem (Opportunity)"
+        elif row['Significant'] and row['Impact on Liking'] < 0:
+            return "Red Flag (Liability)" if high_reach else "Latent Risk (Watch)"
+        else:
+            return "Table Stakes (Expected)" if high_reach else "Low Priority (Unconfirmed)"
+
+    pen_df['Segment'] = pen_df.apply(classify_cata, axis=1)
+    return pen_df.sort_values(by='Impact on Liking', ascending=False).reset_index(drop=True)
+
+
+def calc_jar_penalty(tab_df, target, jar_attrs, scale_type, reach_threshold=15):
+    if not jar_attrs:
+        return None
+    jar_results = []
+    for attr in jar_attrs:
+        vals = tab_df[[attr, target]].dropna()
+        if "3-point" in scale_type:
+            weak, jar, strong = vals[vals[attr] == 1], vals[vals[attr] == 2], vals[vals[attr] == 3]
+        else:
+            weak, jar, strong = vals[vals[attr].isin([1, 2])], vals[vals[attr] == 3], vals[vals[attr].isin([4, 5])]
+        n_total = len(vals)
+        if len(jar) == 0 or n_total == 0:
+            continue
+        jar_mean = jar[target].mean()
+        if len(weak) > 1:
+            p_weak = stats.ttest_ind(jar[target], weak[target], equal_var=False).pvalue
+            drop_weak = jar_mean - weak[target].mean()
+        else:
+            p_weak, drop_weak = np.nan, np.nan
+        if len(strong) > 1:
+            p_strong = stats.ttest_ind(jar[target], strong[target], equal_var=False).pvalue
+            drop_strong = jar_mean - strong[target].mean()
+        else:
+            p_strong, drop_strong = np.nan, np.nan
+        jar_results.append({'Attribute': attr, 'Direction': 'Too Weak', '% Selecting': len(weak) / n_total * 100,
+                             'Impact on Liking': drop_weak, 'p-value': p_weak,
+                             'Significant': bool(p_weak < 0.05) if pd.notna(p_weak) else False})
+        jar_results.append({'Attribute': attr, 'Direction': 'Too Strong', '% Selecting': len(strong) / n_total * 100,
+                             'Impact on Liking': drop_strong, 'p-value': p_strong,
+                             'Significant': bool(p_strong < 0.05) if pd.notna(p_strong) else False})
+    jar_df = pd.DataFrame(jar_results).dropna(subset=['Impact on Liking'])
+    if jar_df.empty:
+        return None
+
+    def classify_jar(row):
+        big_group = row['% Selecting'] >= reach_threshold
+        hurts = row['Impact on Liking'] < 0
+        if row['Significant'] and hurts and big_group:
+            return "Priority fix"
+        elif row['Significant'] and hurts and not big_group:
+            return "Real, but niche"
+        elif (not row['Significant']) and hurts:
+            return "Worth watching"
+        elif (not row['Significant']) and not hurts:
+            return "Low priority"
+        else:
+            return "No action needed"
+
+    jar_df['Verdict'] = jar_df.apply(classify_jar, axis=1)
+    return jar_df.sort_values(by='Impact on Liking', ascending=True).reset_index(drop=True)
+
+
+def calc_kano(tab_df, target, features):
+    tab_data = tab_df[[target] + features].dropna()
+    if tab_data.empty:
+        return None
+    tab_X, tab_y = tab_data[features], tab_data[target]
+    kano_list = []
+    for col in features:
+        reward = tab_y[tab_X[col] >= tab_X[col].median()].mean() - tab_y.mean()
+        penalty = tab_y.mean() - tab_y[tab_X[col] < tab_X[col].median()].mean()
+        if reward > penalty and reward > 0.1:
+            cat = "Delighter (Attractive)"
+        elif penalty > reward and penalty > 0.1:
+            cat = "Must-have (Basic)"
+        elif abs(reward - penalty) < 0.1 and reward > 0.1:
+            cat = "Linear (Performance)"
+        else:
+            cat = "Indifferent"
+        kano_list.append({'Driver': col, 'Reward Potential': reward, 'Penalty Potential': penalty, 'Category': cat})
+    return pd.DataFrame(kano_list)
+
+
+def calc_mixed_model(tab_df, target, features, panelist_col):
+    if panelist_col == "None":
+        return None
+    mm_data = tab_df[[target, panelist_col] + features].dropna()
+    if len(mm_data) < len(features) + 2 or mm_data[panelist_col].nunique() < 2:
+        return None
+    mm_std = mm_data.copy()
+    mm_std[features] = (mm_data[features] - mm_data[features].mean()) / mm_data[features].std()
+    mm_std[target] = (mm_data[target] - mm_data[target].mean()) / mm_data[target].std()
+    formula = f"{target} ~ {' + '.join(features)}"
+    try:
+        mixed_result = smf.mixedlm(formula, mm_std, groups=mm_std[panelist_col]).fit()
+        fe = mixed_result.fe_params.drop('Intercept', errors='ignore')
+        pvals = mixed_result.pvalues
+        return pd.DataFrame({
+            'Driver': fe.index, 'Standardized Coefficient': fe.values,
+            'p-value': [pvals.get(d, np.nan) for d in fe.index]
+        }).sort_values(by='Standardized Coefficient', ascending=False)
+    except Exception:
+        return None
+
+
+# =============================================================================
+# POWERPOINT EXPORT
+# =============================================================================
+
+if PPTX_AVAILABLE:
+    PPTX_SLIDE_W, PPTX_SLIDE_H = Inches(13.333), Inches(7.5)
+else:
+    PPTX_SLIDE_W, PPTX_SLIDE_H = None, None
+
+BAR_ANALYSES = {
+    "Linear Regression": ("Impact Score", calc_linear_regression),
+    "RWA": ("Weight (%)", calc_rwa),
+    "Shapley Values": ("Importance (%)", calc_shapley),
+    "Mixed-Effects Model": ("Standardized Coefficient", calc_mixed_model),
+}
+TABLE_ANALYSES = ["Penalty Analysis (CATA)", "JAR Penalty Analysis", "Kano Analysis", "Path Analysis"]
+
+
+def _pptx_add_title_slide(prs, title_text, subtitle_text):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])  # blank layout
+    box = slide.shapes.add_textbox(Inches(0.8), Inches(2.7), Inches(11.7), Inches(1.2))
+    tf = box.text_frame
+    tf.text = title_text
+    tf.paragraphs[0].font.size = Pt(40)
+    tf.paragraphs[0].font.bold = True
+    sub = slide.shapes.add_textbox(Inches(0.8), Inches(3.8), Inches(11.7), Inches(0.8))
+    stf = sub.text_frame
+    stf.text = subtitle_text
+    stf.paragraphs[0].font.size = Pt(18)
+    stf.paragraphs[0].font.color.rgb = RGBColor(0x60, 0x60, 0x60)
+    return slide
+
+
+def _pptx_add_header(slide, analysis_name, scope_label, n):
+    box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(12.3), Inches(0.9))
+    tf = box.text_frame
+    tf.word_wrap = True
+    p = tf.paragraphs[0]
+    p.text = analysis_name
+    p.font.size = Pt(26)
+    p.font.bold = True
+    p2 = tf.add_paragraph()
+    p2.text = f"{scope_label}   (N = {n})"
+    p2.font.size = Pt(15)
+    p2.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
+
+
+def _pptx_add_bar_chart(slide, df, driver_col, value_col):
+    df = df.sort_values(by=value_col, ascending=True)  # ascending so biggest bar ends up on top
+    chart_data = CategoryChartData()
+    chart_data.categories = df[driver_col].astype(str).tolist()
+    chart_data.add_series(value_col, df[value_col].round(3).tolist())
+    x, y, cx, cy = Inches(0.6), Inches(1.4), Inches(12.1), Inches(5.7)
+    gframe = slide.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, x, y, cx, cy, chart_data)
+    chart = gframe.chart
+    chart.has_legend = False
+    plot = chart.plots[0]
+    plot.has_data_labels = True
+    plot.data_labels.number_format = '0.0'
+    plot.data_labels.number_format_is_linked = False
+    plot.data_labels.font.size = Pt(11)
+
+
+def _pptx_add_table(slide, df, max_rows=14):
+    df = df.head(max_rows)
+    cols = list(df.columns)
+    rows, ncols = len(df) + 1, len(cols)
+    x, y, cx, cy = Inches(0.5), Inches(1.4), Inches(12.3), min(Inches(0.4 * rows), Inches(5.7))
+    table_shape = slide.shapes.add_table(rows, ncols, x, y, cx, cy)
+    table = table_shape.table
+    for j, col in enumerate(cols):
+        cell = table.cell(0, j)
+        cell.text = str(col)
+        cell.text_frame.paragraphs[0].font.bold = True
+        cell.text_frame.paragraphs[0].font.size = Pt(12)
+    for i, (_, row) in enumerate(df.iterrows(), start=1):
+        for j, col in enumerate(cols):
+            val = row[col]
+            if isinstance(val, float):
+                txt = f"{val:.3f}"
+            else:
+                txt = str(val)
+            cell = table.cell(i, j)
+            cell.text = txt
+            cell.text_frame.paragraphs[0].font.size = Pt(11)
+    if len(df) == max_rows:
+        note = slide.shapes.add_textbox(Inches(0.5), y + cy + Inches(0.05), Inches(12), Inches(0.3))
+        note.text_frame.text = f"Showing top {max_rows} rows — see the Excel export for the full table."
+        note.text_frame.paragraphs[0].font.size = Pt(10)
+        note.text_frame.paragraphs[0].font.color.rgb = RGBColor(0x80, 0x80, 0x80)
+
+
+def _pptx_add_empty_slide(prs, analysis_name, scope_label, message):
+    slide = prs.slides.add_slide(prs.slide_layouts[6])
+    _pptx_add_header(slide, analysis_name, scope_label, 0)
+    box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
+    box.text_frame.text = message
+    box.text_frame.paragraphs[0].font.size = Pt(16)
+    box.text_frame.paragraphs[0].font.italic = True
+
+
+def build_pptx(scopes, analysis_types, target, features, panelist_col,
+                cata_format, cata_reach, jar_attrs, jar_scale, jar_reach, sample_label):
+    """scopes: list of (scope_label, filtered_df) tuples — e.g.
+    [("Total Sample", working_df), ("Product: Rose", df_rose), ("Age: 18-24", df_1824), ...]
+    One slide is produced per (analysis, scope) combination."""
+    prs = Presentation()
+    prs.slide_width, prs.slide_height = PPTX_SLIDE_W, PPTX_SLIDE_H
+
+    _pptx_add_title_slide(
+        prs, "Driver Analysis Results",
+        f"{sample_label} — Target: {target} — {len(features)} drivers — {len(scopes)} scope(s) × {len(analysis_types)} analysis(es)"
+    )
+
+    for analysis in analysis_types:
+        for scope_label, scope_df in scopes:
+            slide = prs.slides.add_slide(prs.slide_layouts[6])
+
+            if analysis in BAR_ANALYSES:
+                value_col, calc_fn = BAR_ANALYSES[analysis]
+                if analysis == "Mixed-Effects Model":
+                    result_df = calc_fn(scope_df, target, features, panelist_col)
+                else:
+                    result_df = calc_fn(scope_df, target, features)
+                n = len(scope_df[[target] + features].dropna())
+                _pptx_add_header(slide, analysis, scope_label, n)
+                if result_df is None or result_df.empty:
+                    box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
+                    box.text_frame.text = "Not enough data for this scope to run this analysis."
+                    box.text_frame.paragraphs[0].font.italic = True
+                else:
+                    driver_col = 'Driver' if 'Driver' in result_df.columns else result_df.columns[0]
+                    _pptx_add_bar_chart(slide, result_df, driver_col, value_col)
+
+            elif analysis == "Penalty Analysis (CATA)":
+                result_df = calc_cata_penalty(scope_df, target, features, cata_format, cata_reach)
+                n = len(scope_df[[target] + features].dropna())
+                _pptx_add_header(slide, analysis, scope_label, n)
+                if result_df is None or result_df.empty:
+                    box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
+                    box.text_frame.text = "No 0/1-style CATA attributes detected for this scope."
+                    box.text_frame.paragraphs[0].font.italic = True
+                else:
+                    show_df = result_df[['Attribute', '% Checked', 'Impact on Liking', 'p-value', 'Segment']]
+                    _pptx_add_table(slide, show_df)
+
+            elif analysis == "JAR Penalty Analysis":
+                result_df = calc_jar_penalty(scope_df, target, jar_attrs, jar_scale, jar_reach)
+                n = len(scope_df)
+                _pptx_add_header(slide, analysis, scope_label, n)
+                if not jar_attrs:
+                    box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
+                    box.text_frame.text = "No JAR-type attributes were selected in the JAR tab."
+                    box.text_frame.paragraphs[0].font.italic = True
+                elif result_df is None or result_df.empty:
+                    box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
+                    box.text_frame.text = "Not enough data for this scope to compute JAR penalties."
+                    box.text_frame.paragraphs[0].font.italic = True
+                else:
+                    show_df = result_df[['Attribute', 'Direction', '% Selecting', 'Impact on Liking', 'p-value', 'Verdict']]
+                    _pptx_add_table(slide, show_df)
+
+            elif analysis == "Kano Analysis":
+                result_df = calc_kano(scope_df, target, features)
+                n = len(scope_df[[target] + features].dropna())
+                _pptx_add_header(slide, analysis, scope_label, n)
+                if result_df is None or result_df.empty:
+                    box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
+                    box.text_frame.text = "Not enough data for this scope to run this analysis."
+                    box.text_frame.paragraphs[0].font.italic = True
+                else:
+                    _pptx_add_table(slide, result_df)
+
+            elif analysis == "Path Analysis":
+                n = len(scope_df[[target] + features].dropna())
+                _pptx_add_header(slide, analysis, scope_label, n)
+                try:
+                    path_syntax = f"{target} ~ {' + '.join(features)}"
+                    tab_data = scope_df[[target] + features].dropna()
+                    sem = Model(path_syntax)
+                    sem.fit(tab_data)
+                    res = sem.inspect()
+                    paths = res[res['op'] == '~'][['lval', 'op', 'rval', 'Estimate']]
+                    _pptx_add_table(slide, paths)
+                except Exception as e:
+                    box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
+                    box.text_frame.text = f"Path model could not be fit for this scope ({e})."
+                    box.text_frame.paragraphs[0].font.italic = True
+
+            elif analysis == "Preference Mapping":
+                _pptx_add_header(slide, analysis, scope_label, len(scope_df))
+                box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
+                box.text_frame.text = ("Preference Mapping compares all products at once, so it isn't split "
+                                        "by product/filter — see it live in the app tab instead.")
+                box.text_frame.paragraphs[0].font.italic = True
+
+    output = BytesIO()
+    prs.save(output)
+    return output.getvalue()
+
+
 def product_filter_ui(working_df, product_col, key_prefix):
     """Renders a per-tab 'Run this analysis on: <product>' selector, defaulting to
     'All Products'. Composes with whatever Step 0 sub-target filter is already
@@ -206,14 +599,63 @@ if uploaded_file:
 
     st.sidebar.write("Select Explanatory Variables (Drivers / Attributes):")
     available_drivers = [c for c in working_df.columns if c != target]
-    selection_df = pd.DataFrame({"Select": [False] * len(available_drivers), "Driver_Variable": available_drivers})
+
+    # Auto-detect each question's type from the data (Scale = >2 modalities,
+    # CATA = 2 modalities e.g. yes/no) and flag screeners (name starts with "S").
+    driver_meta_rows = []
+    for c in available_drivers:
+        qtype, is_screener, nun = classify_question(working_df[c], c)
+        driver_meta_rows.append({
+            "Driver_Variable": c, "Type": qtype,
+            "Screener": "🔸 Screener" if is_screener else "",
+            "Modalities": nun
+        })
+    driver_meta_df = pd.DataFrame(driver_meta_rows)
+
+    # Keep the running selection in session_state so it survives search/filter changes.
+    if "selected_drivers" not in st.session_state:
+        st.session_state.selected_drivers = set()
+    st.session_state.selected_drivers &= set(available_drivers)  # drop stale picks (new file/sheet)
+
+    search_q = st.sidebar.text_input(
+        "🔎 Search questions (e.g. type 'Q4' to find every question with Q4 in its name)",
+        value="", key="driver_search"
+    )
+    type_filter = st.sidebar.multiselect(
+        "Filter by question type", ["Scale", "CATA"], default=[], key="driver_type_filter"
+    )
+
+    display_meta = driver_meta_df.copy()
+    if search_q:
+        display_meta = display_meta[display_meta["Driver_Variable"].str.contains(search_q, case=False, na=False, regex=False)]
+    if type_filter:
+        display_meta = display_meta[display_meta["Type"].isin(type_filter)]
+    display_meta = display_meta.copy()
+    display_meta.insert(0, "Select", display_meta["Driver_Variable"].isin(st.session_state.selected_drivers))
 
     edited_df = st.sidebar.data_editor(
-        selection_df, hide_index=True,
-        column_config={"Select": st.column_config.CheckboxColumn(required=True), "Driver_Variable": st.column_config.TextColumn(disabled=True)},
-        use_container_width=True
+        display_meta, hide_index=True,
+        column_config={
+            "Select": st.column_config.CheckboxColumn(required=True),
+            "Driver_Variable": st.column_config.TextColumn("Question", disabled=True),
+            "Type": st.column_config.TextColumn(disabled=True),
+            "Screener": st.column_config.TextColumn(disabled=True),
+            "Modalities": st.column_config.NumberColumn("# codes", disabled=True),
+        },
+        use_container_width=True,
+        key="driver_editor"
     )
-    features = edited_df[edited_df["Select"] == True]["Driver_Variable"].tolist()
+
+    # Merge this (possibly filtered) view's checkbox states back into the full selection.
+    shown_vars = set(display_meta["Driver_Variable"])
+    checked_now = set(edited_df.loc[edited_df["Select"] == True, "Driver_Variable"])
+    st.session_state.selected_drivers = (st.session_state.selected_drivers - shown_vars) | checked_now
+
+    features = [c for c in available_drivers if c in st.session_state.selected_drivers]
+    if search_q or type_filter:
+        st.sidebar.caption(f"Showing {len(display_meta)} of {len(available_drivers)} questions — {len(features)} selected in total.")
+    else:
+        st.sidebar.caption(f"{len(features)} selected.")
 
     # --- STEP 2: ANALYSIS SELECTION ---
     st.sidebar.header("2. Analysis Selection")
@@ -788,5 +1230,83 @@ if uploaded_file:
                 st.download_button("📥 Download Analysis (.xlsx)", xlsx_data, "subtarget_analysis.xlsx")
             else:
                 st.info("Run at least one analysis to enable export.")
+
+            st.divider()
+            st.subheader("🖼️ PowerPoint Export")
+
+            if not PPTX_AVAILABLE:
+                st.error("The `python-pptx` package isn't installed in this environment — "
+                          "run `pip install python-pptx` and restart the app to enable this export.")
+            elif not analysis_types:
+                st.info("Choose at least one analysis in the sidebar (Step 2) to enable PowerPoint export.")
+            else:
+                st.caption("Builds one slide per analysis × scope. **The Total Sample is always included.**")
+
+                # --- Ask about a per-product sub-analysis ---
+                export_product_col = product_col
+                do_product_breakdown = False
+                if product_col == "None":
+                    want_product = st.checkbox("Do you need a sub-analysis by product for this export?", key="ppt_want_product_new")
+                    if want_product:
+                        export_product_col = st.selectbox(
+                            "Product ID wasn't set in the sidebar — which column identifies the product?",
+                            list(working_df.columns), key="ppt_product_col_pick"
+                        )
+                        do_product_breakdown = True
+                else:
+                    do_product_breakdown = st.checkbox(
+                        f"Include a sub-analysis by product ({product_col})?", value=False, key="ppt_want_product_existing"
+                    )
+
+                export_products = []
+                if do_product_breakdown and export_product_col != "None":
+                    all_products = sorted(working_df[export_product_col].dropna().astype(str).unique().tolist())
+                    export_products = st.multiselect(
+                        "Which products should each get their own slide(s)?",
+                        all_products, default=all_products, key="ppt_products_pick"
+                    )
+
+                # --- Ask about a per-filter sub-analysis (e.g. age) ---
+                do_filter_breakdown = st.checkbox(
+                    "Do you need a sub-analysis by an additional filter (e.g. age)?", key="ppt_want_filter"
+                )
+                export_filter_col, export_filter_codes = None, []
+                if do_filter_breakdown:
+                    export_filter_col = st.selectbox("Filter column (e.g. Age)", list(working_df.columns), key="ppt_filter_col_pick")
+                    all_codes = sorted(working_df[export_filter_col].dropna().astype(str).unique().tolist())
+                    export_filter_codes = st.multiselect(
+                        "Which codes should each get their own slide(s)?",
+                        all_codes, default=all_codes, key="ppt_filter_codes_pick"
+                    )
+
+                n_scopes = 1 + len(export_products) + len(export_filter_codes)
+                st.caption(f"This will build **{n_scopes} scope(s) × {len(analysis_types)} analysis(es)** "
+                           f"= up to {n_scopes * len(analysis_types)} slides.")
+
+                if st.button("📊 Generate PowerPoint", key="ppt_generate_btn"):
+                    scopes = [("Total Sample", working_df)]
+                    for p in export_products:
+                        scopes.append((f"Product: {p}", working_df[working_df[export_product_col].astype(str) == p]))
+                    for code in export_filter_codes:
+                        scopes.append((f"{export_filter_col}: {code}", working_df[working_df[export_filter_col].astype(str) == code]))
+
+                    with st.spinner(f"Building up to {n_scopes * len(analysis_types)} slide(s)..."):
+                        ppt_bytes = build_pptx(
+                            scopes=scopes, analysis_types=analysis_types, target=target, features=features,
+                            panelist_col=panelist_col,
+                            cata_format=st.session_state.get("cata_radio", "0/1"),
+                            cata_reach=st.session_state.get("cata_reach", 20),
+                            jar_attrs=st.session_state.get("jar_attrs", []),
+                            jar_scale=st.session_state.get("jar_scale", "3-point (1=Too Weak, 2=JAR, 3=Too Strong)"),
+                            jar_reach=st.session_state.get("jar_reach", 15),
+                            sample_label=f"Sub-Target: {filter_col}" if filter_col != "No Filter" else "Full Sample"
+                        )
+                    st.session_state["ppt_bytes"] = ppt_bytes
+
+                if "ppt_bytes" in st.session_state:
+                    st.download_button(
+                        "📥 Download PowerPoint (.pptx)", st.session_state["ppt_bytes"],
+                        "driver_analysis.pptx", key="ppt_download_btn"
+                    )
     else:
         st.info("👈 Complete the sidebar steps to begin.")
