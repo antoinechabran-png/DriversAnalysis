@@ -694,6 +694,28 @@ if uploaded_file:
 
                 if analysis == "Linear Regression":
                     st.subheader("Linear Regression (Standardized Coefficients)")
+                    st.caption(
+                        "**Impact Score = standardized regression coefficient.** Every driver and the target are "
+                        "rescaled to the same units before fitting, so scores are comparable across drivers "
+                        "regardless of their original scale (1-5, 0/1, etc.). Sign = direction (helps vs. hurts "
+                        "liking); size = strength, **relative to the other drivers in this same model** — drivers "
+                        "that overlap with each other can dilute or distort each other's score."
+                    )
+                    with st.expander("❓ How to read the Impact Score"):
+                        st.markdown(
+                            "| Absolute value | Strength |\n"
+                            "|---|---|\n"
+                            "| 🔘 < 0.1 | Negligible — no real relationship |\n"
+                            "| 🟡 0.1 – 0.3 | Small effect |\n"
+                            "| 🟠 0.3 – 0.5 | Moderate effect |\n"
+                            "| 🔴 > 0.5 | Strong effect |\n\n"
+                            "There's no hard ±1 ceiling. With a *single* driver alone in the model, the score would "
+                            "equal its plain correlation with liking (bounded ±1) — but with several correlated "
+                            "drivers together, the model can occasionally push a score outside that range or even "
+                            "flip its sign (a *suppression effect*). That's not an error; it's a signal to check "
+                            "correlation between your selected drivers. If several are highly correlated, RWA or "
+                            "Shapley Values (other tabs) split credit between them more fairly."
+                        )
                     product_choice = product_filter_ui(working_df, product_col, "linreg")
                     tab_df = apply_product_filter(working_df, product_col, product_choice)
                     tab_data = tab_df[[target] + features].dropna()
