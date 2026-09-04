@@ -76,6 +76,50 @@ def compute_shapley_like(X, y):
     return shap_pct, raw_std_coefs
 
 
+# =============================================================================
+# COLOR ENCODING FOR DRIVER BARS
+# Green = helps liking, red = hurts liking (hue = direction); light -> dark shade
+# within that hue = how strong the effect is (shade = magnitude). This replaces a
+# plain auto-scaled continuous colorscale, whose light/dark cutoffs silently shift
+# depending on whatever min/max happens to be in the current chart - two drivers
+# with the same real-world strength could end up different colors on two different
+# tabs/filters. Buckets below are fixed reference points instead, so a given shade
+# means the same thing everywhere it's used.
+# =============================================================================
+
+GREEN_SHADES = ["#c7e9c0", "#74c476", "#238b45"]  # light -> dark: small / moderate / strong (positive)
+RED_SHADES = ["#fcae91", "#fb6a4a", "#cb181d"]     # light -> dark: small / moderate / strong (negative)
+NEUTRAL_GRAY = "#bdbdbd"
+
+
+def signed_strength_color(value, thresholds=(0.1, 0.3, 0.5)):
+    """For values that already sit on a roughly correlation-like -1..1 scale (standardized
+    regression coefficients, mixed-model fixed effects): buckets |value| against fixed
+    absolute cut points (negligible / small / moderate / strong) and returns a light-to-dark
+    green (positive) or red (negative) shade; gray if negligible."""
+    if pd.isna(value):
+        return NEUTRAL_GRAY
+    mag = abs(value)
+    if mag < thresholds[0]:
+        return NEUTRAL_GRAY
+    shade_idx = 0 if mag < thresholds[1] else (1 if mag < thresholds[2] else 2)
+    return (GREEN_SHADES if value > 0 else RED_SHADES)[shade_idx]
+
+
+def share_strength_color(magnitude, direction, n_drivers):
+    """For %-of-total metrics that are always >= 0 and carry a separate direction (RWA Weight %,
+    Shapley Importance %): buckets magnitude against an 'equal split' baseline (100 / n_drivers)
+    rather than a fixed absolute scale, since what counts as a 'big' share depends on how many
+    drivers are being compared. direction: 'Positive' / 'Negative' / 'Neutral'."""
+    if pd.isna(magnitude) or direction == 'Neutral':
+        return NEUTRAL_GRAY
+    equal_share = 100.0 / max(n_drivers, 1)
+    if magnitude < 0.5 * equal_share:
+        return NEUTRAL_GRAY
+    shade_idx = 0 if magnitude < equal_share else (1 if magnitude < 2 * equal_share else 2)
+    return (GREEN_SHADES if direction == 'Positive' else RED_SHADES)[shade_idx]
+
+
 def bootstrap_weights(X, y, method_func, n_boot=500, cluster_ids=None):
     """
     Resample the data with replacement n_boot times, re-run method_func on each
@@ -103,10 +147,11 @@ def bootstrap_weights(X, y, method_func, n_boot=500, cluster_ids=None):
     return pd.DataFrame(boot_rows)
 
 
-def render_bootstrap_bar(df, value_col, driver_col, direction_col, color_map, title, key_prefix,
+def render_bootstrap_bar(df, value_col, driver_col, bar_colors, title, key_prefix,
                           X, y, method_func, panelist_col, working_df, x_index):
     """Shared UI block: checkbox to toggle bootstrap CIs, then renders either a plain
-    bar chart or a bar chart with 95% CI error bars."""
+    bar chart or a bar chart with 95% CI error bars. bar_colors is a list/Series of hex
+    colors aligned to df's row order (see signed_strength_color / share_strength_color)."""
     enable_boot = st.checkbox("🔁 Compute Bootstrap Confidence Intervals", key=f"{key_prefix}_boot")
     if enable_boot:
         n_boot = st.slider("Number of bootstrap resamples", 100, 2000, 500, step=100, key=f"{key_prefix}_nboot")
@@ -115,8 +160,8 @@ def render_bootstrap_bar(df, value_col, driver_col, direction_col, color_map, ti
             boot_df = bootstrap_weights(X, y, method_func, n_boot=n_boot, cluster_ids=cluster_ids)
         if boot_df.empty:
             st.warning("Bootstrap did not produce valid resamples (data may be too small/collinear). Showing point estimates only.")
-            fig = px.bar(df, x=value_col, y=driver_col, orientation='h', color=direction_col,
-                         color_discrete_map=color_map)
+            fig = go.Figure(go.Bar(x=df[value_col], y=df[driver_col], orientation='h', marker_color=bar_colors))
+            fig.update_layout(height=450, xaxis_title=value_col)
             st.plotly_chart(fig, use_container_width=True)
             return df
         ci_lower = boot_df.quantile(0.025)
@@ -130,7 +175,7 @@ def render_bootstrap_bar(df, value_col, driver_col, direction_col, color_map, ti
             error_x=dict(type='data', symmetric=False,
                          array=(df['CI Upper'] - df[value_col]).clip(lower=0),
                          arrayminus=(df[value_col] - df['CI Lower']).clip(lower=0)),
-            marker_color=df[direction_col].map(color_map)
+            marker_color=bar_colors
         ))
         fig.update_layout(title=f"{title} with 95% Bootstrap CI", xaxis_title=value_col, height=450)
         st.plotly_chart(fig, use_container_width=True)
@@ -138,8 +183,8 @@ def render_bootstrap_bar(df, value_col, driver_col, direction_col, color_map, ti
                    (f", clustered by {panelist_col} (whole panelists resampled together)." if panelist_col != "None" else " (row-level resampling)."))
         return df
     else:
-        fig = px.bar(df, x=value_col, y=driver_col, orientation='h', color=direction_col,
-                     color_discrete_map=color_map)
+        fig = go.Figure(go.Bar(x=df[value_col], y=df[driver_col], orientation='h', marker_color=bar_colors))
+        fig.update_layout(height=450, xaxis_title=value_col)
         st.plotly_chart(fig, use_container_width=True)
         return df
 
@@ -694,28 +739,6 @@ if uploaded_file:
 
                 if analysis == "Linear Regression":
                     st.subheader("Linear Regression (Standardized Coefficients)")
-                    st.caption(
-                        "**Impact Score = standardized regression coefficient.** Every driver and the target are "
-                        "rescaled to the same units before fitting, so scores are comparable across drivers "
-                        "regardless of their original scale (1-5, 0/1, etc.). Sign = direction (helps vs. hurts "
-                        "liking); size = strength, **relative to the other drivers in this same model** — drivers "
-                        "that overlap with each other can dilute or distort each other's score."
-                    )
-                    with st.expander("❓ How to read the Impact Score"):
-                        st.markdown(
-                            "| Absolute value | Strength |\n"
-                            "|---|---|\n"
-                            "| 🔘 < 0.1 | Negligible — no real relationship |\n"
-                            "| 🟡 0.1 – 0.3 | Small effect |\n"
-                            "| 🟠 0.3 – 0.5 | Moderate effect |\n"
-                            "| 🔴 > 0.5 | Strong effect |\n\n"
-                            "There's no hard ±1 ceiling. With a *single* driver alone in the model, the score would "
-                            "equal its plain correlation with liking (bounded ±1) — but with several correlated "
-                            "drivers together, the model can occasionally push a score outside that range or even "
-                            "flip its sign (a *suppression effect*). That's not an error; it's a signal to check "
-                            "correlation between your selected drivers. If several are highly correlated, RWA or "
-                            "Shapley Values (other tabs) split credit between them more fairly."
-                        )
                     product_choice = product_filter_ui(working_df, product_col, "linreg")
                     tab_df = apply_product_filter(working_df, product_col, product_choice)
                     tab_data = tab_df[[target] + features].dropna()
@@ -727,7 +750,14 @@ if uploaded_file:
                         tab_model = sm.OLS(tab_y, sm.add_constant(tab_X)).fit()
                         std_coefs = tab_model.params.iloc[1:] * (tab_X.std() / tab_y.std())
                         reg_df = pd.DataFrame({'Driver': std_coefs.index, 'Impact Score': std_coefs.values}).sort_values(by='Impact Score', ascending=False)
-                        st.plotly_chart(px.bar(reg_df, x='Impact Score', y='Driver', orientation='h', color='Impact Score', color_continuous_scale="RdYlGn"), use_container_width=True)
+                        bar_colors = [signed_strength_color(v) for v in reg_df['Impact Score']]
+                        st.caption(
+                            "🟢 green = helps liking · 🔴 red = hurts liking · shade = strength "
+                            "(light < 0.3, medium < 0.5, dark ≥ 0.5) · gray = negligible (< 0.1)."
+                        )
+                        fig = go.Figure(go.Bar(x=reg_df['Impact Score'], y=reg_df['Driver'], orientation='h', marker_color=bar_colors))
+                        fig.update_layout(height=450, xaxis_title='Impact Score')
+                        st.plotly_chart(fig, use_container_width=True)
                         reg_df['Product Filter'] = product_choice
                         results_to_export["Regression"] = reg_df
 
@@ -742,9 +772,14 @@ if uploaded_file:
                         st.warning(f"⚠️ Not enough data for '{product_choice}' (N={len(tab_data)}) to run this analysis.")
                     else:
                         rwa_df = run_rwa(tab_X, tab_y)
-                        color_map = {'Positive': '#2ca02c', 'Negative': '#d62728', 'Neutral': 'gray'}
+                        bar_colors = [share_strength_color(r['Weight (%)'], r['Direction'], len(features)) for _, r in rwa_df.iterrows()]
+                        st.caption(
+                            f"🟢 green = positive driver · 🔴 red = negative driver · shade = strength relative to "
+                            f"an equal split across your {len(features)} drivers (~{100/len(features):.0f}% each) — "
+                            "light ≈ that baseline, dark ≥ 2× it · gray = well below baseline."
+                        )
                         rwa_df = render_bootstrap_bar(
-                            rwa_df, 'Weight (%)', 'Driver', 'Direction', color_map,
+                            rwa_df, 'Weight (%)', 'Driver', bar_colors,
                             "RWA Weights", "rwa", tab_X, tab_y,
                             lambda Xb, yb: run_rwa(Xb, yb).set_index('Driver')['Weight (%)'],
                             panelist_col, tab_df, tab_X.index
@@ -768,9 +803,14 @@ if uploaded_file:
                             'Importance (%)': shap_pct.values,
                             'Direction': np.where(raw_std_coefs.values > 0, 'Positive', 'Negative')
                         }).sort_values(by='Importance (%)', ascending=False)
-                        color_map = {'Positive': '#2ca02c', 'Negative': '#d62728'}
+                        bar_colors = [share_strength_color(r['Importance (%)'], r['Direction'], len(features)) for _, r in shap_df.iterrows()]
+                        st.caption(
+                            f"🟢 green = positive driver · 🔴 red = negative driver · shade = strength relative to "
+                            f"an equal split across your {len(features)} drivers (~{100/len(features):.0f}% each) — "
+                            "light ≈ that baseline, dark ≥ 2× it · gray = well below baseline."
+                        )
                         shap_df = render_bootstrap_bar(
-                            shap_df, 'Importance (%)', 'Driver', 'Direction', color_map,
+                            shap_df, 'Importance (%)', 'Driver', bar_colors,
                             "Shapley-style Importance", "shap", tab_X, tab_y,
                             lambda Xb, yb: compute_shapley_like(Xb, yb)[0],
                             panelist_col, tab_df, tab_X.index
@@ -1157,9 +1197,18 @@ if uploaded_file:
                                     'p-value': [pvals.get(d, np.nan) for d in fe.index]
                                 }).sort_values(by='Standardized Coefficient', ascending=False)
 
-                                st.plotly_chart(px.bar(mm_df, x='Standardized Coefficient', y='Driver', orientation='h',
-                                                        color='Standardized Coefficient', color_continuous_scale="RdYlGn",
-                                                        title=f"Mixed Model Fixed Effects (Standardized) — {product_choice}"), use_container_width=True)
+                                bar_colors = [signed_strength_color(v) for v in mm_df['Standardized Coefficient']]
+                                fig = go.Figure(go.Bar(
+                                    x=mm_df['Standardized Coefficient'], y=mm_df['Driver'], orientation='h',
+                                    marker_color=bar_colors
+                                ))
+                                fig.update_layout(height=450, xaxis_title='Standardized Coefficient',
+                                                   title=f"Mixed Model Fixed Effects (Standardized) — {product_choice}")
+                                st.plotly_chart(fig, use_container_width=True)
+                                st.caption(
+                                    "🟢 green = helps liking · 🔴 red = hurts liking · shade = strength "
+                                    "(light < 0.3, medium < 0.5, dark ≥ 0.5) · gray = negligible (< 0.1)."
+                                )
 
                                 n_panelists = mm_data[panelist_col].nunique()
                                 st.caption(f"Random intercept fit across {n_panelists} panelists ({len(mm_data)} total ratings).")
