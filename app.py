@@ -120,55 +120,47 @@ def display_plot(fig, **kwargs):
     st.plotly_chart(fig, **kwargs)
 
 
-def path_diagram(paths, outcome, coefficient_column, scope):
-    """Show incoming regression paths for one outcome, without implying flow volumes."""
+def path_diagram(paths, outcome, coefficient_column, scope, neutral_threshold=0.05):
+    """Signed Sankey: ribbon widths encode magnitude, colors encode direction."""
     edges = paths.loc[paths['lval'] == outcome].copy()
     edges['_value'] = pd.to_numeric(edges[coefficient_column], errors='coerce')
     edges = edges.loc[np.isfinite(edges['_value'])].copy()
     edges['_strength'] = edges['_value'].abs()
     edges = edges.sort_values(['_strength', 'rval'], ascending=[False, True], kind='stable')
-    fig = go.Figure()
-    n = len(edges)
-    height = max(430, 100 + n * 85)
-    peak = max(edges['_strength'].max(), 1e-9) if n else 1
-    center = (n - 1) / 2
-    standardized = coefficient_column == 'Est. Std'
-    def wrap_label(value):
-        return '<br>'.join(html.escape(line) for line in textwrap.wrap(str(value), width=32))
-    for position, (_, row) in enumerate(edges.iterrows()):
-        y = n - 1 - position
+    colors, link_colors, details, labels = [], [], [], []
+    for _, row in edges.iterrows():
         value = row['_value']
+        neutral = abs(value) <= neutral_threshold
+        color = '#8993A1' if neutral else '#16845B' if value > 0 else '#CC3975'
+        ribbon = 'rgba(137,147,161,0.60)' if neutral else 'rgba(22,132,91,0.62)' if value > 0 else 'rgba(204,57,117,0.62)'
+        colors.append(color)
+        link_colors.append(ribbon)
+        label = html.escape(str(display_label(row['rval'])))
+        labels.append(f'{label}   ({value:+.3f})')
         pvalue = pd.to_numeric(pd.Series([row.get('p-value')]), errors='coerce').iloc[0]
-        significant = pd.notna(pvalue) and pvalue < .05
-        color = '#18845b' if value > 0 else '#c64b50' if value < 0 else '#718096'
-        width = 1.5 + 4 * abs(value) / peak
-        label = display_label(row['rval'])
         ptext = f'{pvalue:.4g}' if pd.notna(pvalue) else 'unavailable'
-        hover = (f"{html.escape(str(label))} → {html.escape(str(display_label(outcome)))}"
-                 f"<br>{'Standardized coefficient' if standardized else 'Estimate'}: {value:+.3f}"
-                 f"<br>p-value: {ptext}<br>Variable: {html.escape(str(row['rval']))}")
-        # Fan out the arrow endpoints to keep every incoming path visible.
-        end_y = center + (y - center) * .18
-        fig.add_trace(go.Scatter(x=[.43, .80], y=[y, end_y], mode='lines',
-            line=dict(color=color, width=width, dash='solid' if significant else 'dot'),
-            hovertemplate=hover + '<extra></extra>', showlegend=False))
-        fig.add_annotation(x=.82, y=end_y, ax=.77, ay=end_y + (y-end_y)*(.05/.37),
-            xref='x', yref='y', axref='x', ayref='y', text='', showarrow=True,
-            arrowhead=3, arrowsize=1, arrowwidth=width, arrowcolor=color)
-        fig.add_annotation(x=.015, y=y, text=wrap_label(label), showarrow=False,
-            xanchor='left', align='left', font=dict(size=14, color='#243247'),
-            bgcolor='#f3f6fa', bordercolor='#dce4ee', borderpad=10)
-        fig.add_annotation(x=.405, y=y, text=f"<b>{value:+.3f}</b>", showarrow=False,
-            xanchor='right', font=dict(size=14, color=color), bgcolor='white', borderpad=4)
-    fig.add_annotation(x=.84, y=center, text='<b>' + wrap_label(display_label(outcome)) + '</b>',
-        showarrow=False, xanchor='left', align='left', bgcolor='#e8effb',
-        bordercolor='#a9bfdf', borderpad=14, font=dict(size=15, color='#203c66'))
-    fig.update_layout(template='plotly_white', height=height,
-        title=dict(text='Paths to ' + html.escape(str(display_label(outcome))), font=dict(size=22)),
-        margin=dict(l=15, r=20, t=75, b=25), paper_bgcolor='white', plot_bgcolor='white',
-        xaxis=dict(range=[0, 1.22], visible=False, fixedrange=True),
-        yaxis=dict(range=[-1, max(n, 1)], visible=False, fixedrange=True),
-        hoverlabel=dict(bgcolor='white', font_size=13))
+        details.append(f"{label} → {html.escape(str(display_label(outcome)))}<br>Coefficient: {value:+.3f}<br>p-value: {ptext}<br>Variable: {html.escape(str(row['rval']))}")
+    n = len(edges)
+    fig = go.Figure()
+    if n:
+        # Separate fixed source positions prevent small effects' labels collapsing.
+        positions = np.linspace(.025, .975, n).tolist() if n > 1 else [.5]
+        fig.add_trace(go.Sankey(
+            arrangement='fixed', orientation='h',
+            textfont=dict(color='#172536', size=15, shadow='none'),
+            node=dict(pad=28, thickness=22, line=dict(color='white', width=1.5),
+                label=labels + [html.escape(str(display_label(outcome)))],
+                color=colors + ['#263D54'], x=[.015] * n + [.985], y=positions + [.5],
+                customdata=details + [html.escape(str(display_label(outcome)))],
+                hovertemplate='%{customdata}<extra></extra>'),
+            link=dict(source=list(range(n)), target=[n] * n,
+                value=edges['_strength'].tolist(), color=link_colors,
+                customdata=details, hovertemplate='%{customdata}<extra></extra>')))
+    fig.update_layout(template='plotly_white', height=max(480, 130 + n * 85),
+        title=dict(text='Paths to ' + html.escape(str(display_label(outcome))), font=dict(size=22, color='#172536')),
+        margin=dict(l=25, r=25, t=85, b=45), paper_bgcolor='white',
+        font=dict(family='Arial, sans-serif', size=15, color='#172536'),
+        hoverlabel=dict(bgcolor='white', font_size=14, font_color='#172536'))
     return fig
 
 
@@ -1408,10 +1400,16 @@ if uploaded_file:
                                     coefficient_column = st.radio("Coefficient scale", coefficient_options,
                                         format_func=lambda value: 'Standardized' if value == 'Est. Std' else 'Original units',
                                         horizontal=True, key=f"path_scale_{path_signature}")
-                                    fig = path_diagram(paths, outcome, coefficient_column, product_choice)
+                                    neutral_threshold = st.number_input(
+                                        "Neutral band (absolute coefficient at or below this value)",
+                                        min_value=0.0, value=0.05 if coefficient_column == 'Est. Std' else 0.0,
+                                        step=0.01, format="%.3f",
+                                        key=f"path_neutral_{path_signature}_{coefficient_column}",
+                                        help="Grey indicates near-zero magnitude, not statistical nonsignificance. The threshold uses the selected coefficient scale.")
+                                    fig = path_diagram(paths, outcome, coefficient_column, product_choice, neutral_threshold)
                                     st.plotly_chart(fig, use_container_width=True,
                                         config={'displaylogo': False, 'toImageButtonOptions': {'format': 'svg', 'filename': 'path_analysis'}})
-                                    st.caption("Green = positive coefficient · Red = negative coefficient. Line width shows absolute coefficient size within this view. Solid lines: p < 0.05; dotted lines: p ≥ 0.05 or unavailable. Values are printed beside each attribute. Hover over a line for details.")
+                                    st.caption("Green = positive · Pink = negative · Grey = within the neutral band. Ribbon width represents the absolute coefficient, not a flow volume. Signed coefficients appear beside each attribute; hover for p-values. Exactly zero effects have no ribbon. Colour does not indicate statistical significance.")
                                     if len(outcomes) > 1:
                                         st.caption("This view shows direct incoming paths for the selected outcome. Switch outcomes to inspect mediators and other equations; the summary below includes all model parameters.")
                                 else:
