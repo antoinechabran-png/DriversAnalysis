@@ -9,6 +9,8 @@ from io import BytesIO
 from semopy import Model
 import re
 import hashlib
+import textwrap
+import html
 from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -116,6 +118,59 @@ def display_plot(fig, **kwargs):
                 trace.customdata = [display_label(v) for v in trace.y]
                 trace.hovertemplate = '%{customdata}<br>%{x}<extra></extra>'
     st.plotly_chart(fig, **kwargs)
+
+
+def path_diagram(paths, outcome, coefficient_column, scope):
+    """Show incoming regression paths for one outcome, without implying flow volumes."""
+    edges = paths.loc[paths['lval'] == outcome].copy()
+    edges['_value'] = pd.to_numeric(edges[coefficient_column], errors='coerce')
+    edges = edges.loc[np.isfinite(edges['_value'])].copy()
+    edges['_strength'] = edges['_value'].abs()
+    edges = edges.sort_values(['_strength', 'rval'], ascending=[False, True], kind='stable')
+    fig = go.Figure()
+    n = len(edges)
+    height = max(430, 100 + n * 85)
+    peak = max(edges['_strength'].max(), 1e-9) if n else 1
+    center = (n - 1) / 2
+    standardized = coefficient_column == 'Est. Std'
+    def wrap_label(value):
+        return '<br>'.join(html.escape(line) for line in textwrap.wrap(str(value), width=32))
+    for position, (_, row) in enumerate(edges.iterrows()):
+        y = n - 1 - position
+        value = row['_value']
+        pvalue = pd.to_numeric(pd.Series([row.get('p-value')]), errors='coerce').iloc[0]
+        significant = pd.notna(pvalue) and pvalue < .05
+        color = '#18845b' if value > 0 else '#c64b50' if value < 0 else '#718096'
+        width = 1.5 + 4 * abs(value) / peak
+        label = display_label(row['rval'])
+        ptext = f'{pvalue:.4g}' if pd.notna(pvalue) else 'unavailable'
+        hover = (f"{html.escape(str(label))} → {html.escape(str(display_label(outcome)))}"
+                 f"<br>{'Standardized coefficient' if standardized else 'Estimate'}: {value:+.3f}"
+                 f"<br>p-value: {ptext}<br>Variable: {html.escape(str(row['rval']))}")
+        # Fan out the arrow endpoints to keep every incoming path visible.
+        end_y = center + (y - center) * .18
+        fig.add_trace(go.Scatter(x=[.43, .80], y=[y, end_y], mode='lines',
+            line=dict(color=color, width=width, dash='solid' if significant else 'dot'),
+            hovertemplate=hover + '<extra></extra>', showlegend=False))
+        fig.add_annotation(x=.82, y=end_y, ax=.77, ay=end_y + (y-end_y)*(.05/.37),
+            xref='x', yref='y', axref='x', ayref='y', text='', showarrow=True,
+            arrowhead=3, arrowsize=1, arrowwidth=width, arrowcolor=color)
+        fig.add_annotation(x=.015, y=y, text=wrap_label(label), showarrow=False,
+            xanchor='left', align='left', font=dict(size=14, color='#243247'),
+            bgcolor='#f3f6fa', bordercolor='#dce4ee', borderpad=10)
+        fig.add_annotation(x=.405, y=y, text=f"<b>{value:+.3f}</b>", showarrow=False,
+            xanchor='right', font=dict(size=14, color=color), bgcolor='white', borderpad=4)
+    fig.add_annotation(x=.84, y=center, text='<b>' + wrap_label(display_label(outcome)) + '</b>',
+        showarrow=False, xanchor='left', align='left', bgcolor='#e8effb',
+        bordercolor='#a9bfdf', borderpad=14, font=dict(size=15, color='#203c66'))
+    fig.update_layout(template='plotly_white', height=height,
+        title=dict(text='Paths to ' + html.escape(str(display_label(outcome))), font=dict(size=22)),
+        margin=dict(l=15, r=20, t=75, b=25), paper_bgcolor='white', plot_bgcolor='white',
+        xaxis=dict(range=[0, 1.22], visible=False, fixedrange=True),
+        yaxis=dict(range=[-1, max(n, 1)], visible=False, fixedrange=True),
+        hoverlabel=dict(bgcolor='white', font_size=13))
+    return fig
+
 
 def model_summary(frame, metrics=None, note=None):
     summary_tab, = st.tabs(['Model summary'])
@@ -780,6 +835,24 @@ if uploaded_file:
     if type_filter:
         display_meta = display_meta[display_meta["Type"].isin(type_filter)]
     display_meta = display_meta.copy()
+    bulk_scope = st.sidebar.radio(
+        "Select / unselect scope", ["Shown questions", "All questions"],
+        horizontal=True, key="driver_bulk_scope",
+        help="Shown questions respects the search and type filters. All questions includes questions hidden by those filters."
+    )
+    bulk_variables = (set(display_meta["Driver_Variable"])
+                      if bulk_scope == "Shown questions" else set(available_drivers))
+    select_column, clear_column = st.sidebar.columns(2)
+    select_all = select_column.button("Select all", key="drivers_select_all", disabled=not bulk_variables)
+    unselect_all = clear_column.button("Unselect all", key="drivers_unselect_all", disabled=not bulk_variables)
+    if select_all or unselect_all:
+        if select_all:
+            st.session_state.selected_drivers |= bulk_variables
+        else:
+            st.session_state.selected_drivers -= bulk_variables
+        # Remount the editor so old checkbox deltas cannot undo the bulk action.
+        st.session_state["driver_editor_revision"] = st.session_state.get("driver_editor_revision", 0) + 1
+    st.sidebar.caption(f"Buttons apply to {len(bulk_variables)} questions ({bulk_scope.lower()}).")
     display_meta.insert(0, "Select", display_meta["Driver_Variable"].isin(st.session_state.selected_drivers))
 
     edited_df = st.sidebar.data_editor(
@@ -792,7 +865,7 @@ if uploaded_file:
             "Modalities": st.column_config.NumberColumn("# codes", disabled=True),
         },
         use_container_width=True,
-        key="driver_editor"
+        key=f"driver_editor_{st.session_state.get('driver_editor_revision', 0)}"
     )
 
     # Merge this (possibly filtered) view's checkbox states back into the full selection.
@@ -1311,7 +1384,7 @@ if uploaded_file:
                     tab_df = apply_product_filter(working_df, product_col, product_choice)
                     tab_data = tab_df[[target] + features].dropna()
                     path_syntax = st.text_area("Syntax", value=f"{target} ~ {' + '.join(features)}", key="path_syntax")
-                    path_signature = hashlib.sha256(pd.util.hash_pandas_object(tab_data, index=True).values.tobytes() + str(list(tab_data.columns)).encode() + path_syntax.encode()).hexdigest()
+                    path_signature = hashlib.sha256(pd.util.hash_pandas_object(tab_data, index=True).values.tobytes() + str(list(tab_data.columns)).encode() + path_syntax.encode() + b'path-visual-v2').hexdigest()
                     run_path = st.button("Run Path Model")
                     if run_path or path_signature in st.session_state.get('path_results', {}):
                         if tab_data.empty:
@@ -1321,17 +1394,28 @@ if uploaded_file:
                                 if run_path:
                                     sem = Model(path_syntax)
                                     sem.fit(tab_data)
-                                    st.session_state['path_results'] = {path_signature: sem.inspect()}
+                                    st.session_state['path_results'] = {path_signature: sem.inspect(std_est=True)}
                                 res = st.session_state['path_results'][path_signature].copy()
                                 paths = res[res['op'] == '~']
-                                labels = list(set(paths['lval'].tolist() + paths['rval'].tolist()))
-                                fig = go.Figure(data=[go.Sankey(
-                                    node=dict(pad=15, thickness=20, label=labels, color="blue"),
-                                    link=dict(source=[labels.index(x) for x in paths['rval']],
-                                              target=[labels.index(x) for x in paths['lval']],
-                                              value=np.abs(paths['Estimate']).tolist(),
-                                              label=paths['Estimate'].round(3).astype(str).tolist()))])
-                                display_plot(fig, use_container_width=True)
+                                if not paths.empty:
+                                    outcomes = list(dict.fromkeys(paths['lval'].tolist()))
+                                    outcome = st.selectbox("Show incoming paths to", outcomes,
+                                        index=outcomes.index(target) if target in outcomes else 0,
+                                        format_func=display_label, key=f"path_outcome_{path_signature}")
+                                    coefficient_options = ['Estimate']
+                                    if 'Est. Std' in paths.columns:
+                                        coefficient_options.insert(0, 'Est. Std')
+                                    coefficient_column = st.radio("Coefficient scale", coefficient_options,
+                                        format_func=lambda value: 'Standardized' if value == 'Est. Std' else 'Original units',
+                                        horizontal=True, key=f"path_scale_{path_signature}")
+                                    fig = path_diagram(paths, outcome, coefficient_column, product_choice)
+                                    st.plotly_chart(fig, use_container_width=True,
+                                        config={'displaylogo': False, 'toImageButtonOptions': {'format': 'svg', 'filename': 'path_analysis'}})
+                                    st.caption("Green = positive coefficient · Red = negative coefficient. Line width shows absolute coefficient size within this view. Solid lines: p < 0.05; dotted lines: p ≥ 0.05 or unavailable. Values are printed beside each attribute. Hover over a line for details.")
+                                    if len(outcomes) > 1:
+                                        st.caption("This view shows direct incoming paths for the selected outcome. Switch outcomes to inspect mediators and other equations; the summary below includes all model parameters.")
+                                else:
+                                    st.info("The fitted model contains no regression paths to display.")
                                 model_summary(res, {'Observations': len(tab_data)})
                                 res['Product Filter'] = product_choice
                                 results_to_export["Path"] = res
