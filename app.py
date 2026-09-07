@@ -35,6 +35,53 @@ st.set_page_config(page_title="Consumer Driver Analysis Tool", layout="wide")
 # Display labels never change the columns supplied to statistical models.
 DISPLAY_LABELS = {}
 
+
+def label_words(value, remove_code=True):
+    text = str(value).strip()
+    if remove_code:
+        text = re.sub(r'^\s*[QS](?:[_\s-]*\d+)+(?:[_\s-]+|$)', '', text, flags=re.I)
+    return re.sub(r'[_\s]+', ' ', text).strip(' -')
+
+def suggest_prefixes(variables):
+    groups = {}
+    for variable in variables:
+        words = label_words(variable).split()
+        for length in range(1, len(words)):
+            prefix = ' '.join(words[:length])
+            groups.setdefault(prefix, set()).add(variable)
+    # Keep the longest shared beginning for each group of variables.
+    candidates = {prefix: members for prefix, members in groups.items() if len(members) >= 2}
+    return {prefix: len(members) for prefix, members in sorted(candidates.items())
+            if not any(other.startswith(prefix + ' ') and other_members == members
+                       for other, other_members in candidates.items())}
+
+def clean_label(variable, prefixes=(), remove_code=True):
+    text = label_words(variable, remove_code)
+    for prefix in sorted({label_words(p, False) for p in prefixes if p.strip()}, key=len, reverse=True):
+        if text.casefold().startswith(prefix.casefold() + ' '):
+            text = text[len(prefix):].strip()
+            break
+    return text or str(variable)
+
+def numeric_model_inputs(frame, columns):
+    result = frame.copy()
+    issues = []
+    for column in dict.fromkeys(columns):
+        values = frame[column]
+        if pd.api.types.is_datetime64_any_dtype(values.dtype):
+            issues.append({'Variable': column, 'Problem': 'Dates must be explicitly encoded before modeling.'})
+            continue
+        normalized = values.map(lambda v: v.strip() if isinstance(v, str) else v).replace('', np.nan)
+        converted = pd.to_numeric(normalized, errors='coerce').astype(float)
+        invalid = normalized.notna() & converted.isna()
+        if invalid.any():
+            issues.append({'Variable': column, 'Problem': f'{int(invalid.sum())} nonnumeric value(s). Encode categories or deselect this variable.'})
+        if np.isinf(converted).any():
+            issues.append({'Variable': column, 'Problem': 'Infinite values must be corrected in the source data.'})
+        result[column] = converted
+    return result, issues
+
+
 def display_label(value):
     return DISPLAY_LABELS.get(value, value) if isinstance(value, str) else value
 
@@ -762,21 +809,49 @@ if uploaded_file:
     # Scope edits to file contents and sheet; preserve them across model/filter changes.
     label_scope = hashlib.sha256(uploaded_file.getvalue() + selected_sheet.encode()).hexdigest()[:16]
     with st.expander("Edit explanatory variable labels", expanded=False):
-        st.caption("Edit Display label, then click Apply labels. Labels apply to all charts, tables, insights and exports. Blank labels use the variable name. Model syntax keeps the original variable names.")
+        st.caption("Labels affect charts, tables, insights and exports only. Model syntax keeps original variable names. Changes remain in this session for this file and sheet.")
         label_key = f"display_labels_{label_scope}"
+        draft_key = f"label_draft_{label_scope}"
+        revision_key = f"label_revision_{label_scope}"
         saved_labels = st.session_state.get(label_key, {})
+        suggestions = suggest_prefixes(available_drivers)
+        remove_code = st.checkbox("Remove question codes (for example Q_05_3 or S-2)", value=True, key=f"strip_code_{label_scope}")
+        prefixes = st.multiselect("Repeated prefixes to remove", list(suggestions),
+            format_func=lambda value: f"{value} ({suggestions[value]} variables)",
+            key=f"prefixes_{label_scope}")
+        st.caption("Select only wording that is unnecessary. A repeated beginning may carry meaning, such as 'Too' in 'Too sweet'. No prefix is selected automatically.")
+        custom_prefixes = st.text_area("Additional prefixes to remove (one per line)", key=f"custom_prefixes_{label_scope}")
+        preserve_manual = st.checkbox("Preserve labels I have already edited", value=True, key=f"preserve_labels_{label_scope}")
+        if st.button("Suggest cleaning / refresh preview", key=f"suggest_{label_scope}"):
+            all_prefixes = prefixes + custom_prefixes.splitlines()
+            st.session_state[draft_key] = {
+                v: saved_labels[v] if preserve_manual and saved_labels.get(v, v) != v
+                else clean_label(v, all_prefixes, remove_code) for v in available_drivers}
+            st.session_state[revision_key] = st.session_state.get(revision_key, 0) + 1
+        if st.button("Preview original labels", key=f"restore_{label_scope}"):
+            st.session_state[draft_key] = {v: v for v in available_drivers}
+            st.session_state[revision_key] = st.session_state.get(revision_key, 0) + 1
+        draft = st.session_state.get(draft_key, saved_labels)
+        st.caption("Review and edit the preview, then click Apply labels. Blank labels use the original variable name.")
+        label_rows = pd.DataFrame({'Variable': available_drivers,
+            'Current label': [saved_labels.get(v, v) for v in available_drivers],
+            'Display label': [draft.get(v, v) for v in available_drivers]})
         with st.form(f"label_form_{label_scope}"):
-            label_rows = pd.DataFrame({'Variable': available_drivers,
-                'Display label': [saved_labels.get(v, v) for v in available_drivers]})
-            label_edits = st.data_editor(label_rows, disabled=['Variable'], hide_index=True,
-                use_container_width=True, key=f"label_editor_{label_scope}")
+            label_edits = st.data_editor(label_rows, disabled=['Variable', 'Current label'], hide_index=True,
+                use_container_width=True, key=f"label_editor_{label_scope}_{st.session_state.get(revision_key, 0)}")
             apply_labels = st.form_submit_button("Apply labels")
-        if apply_labels:
-            st.session_state[label_key] = {
-                row['Variable']: (str(row['Display label']).strip()
+        proposed = {row['Variable']: str(row['Display label']).strip()
                     if pd.notna(row['Display label']) and str(row['Display label']).strip()
-                    else row['Variable']) for _, row in label_edits.iterrows()}
+                    else row['Variable'] for _, row in label_edits.iterrows()}
+        duplicates = pd.Series(proposed).loc[lambda values: values.duplicated(keep=False)]
+        if not duplicates.empty:
+            st.warning("Some display labels are identical. Consider making them distinct in the preview; original variable IDs remain separate.")
+            st.dataframe(duplicates.rename('Display label').rename_axis('Variable').reset_index(), hide_index=True)
+        if apply_labels:
+            st.session_state[label_key] = proposed
+            st.session_state[draft_key] = proposed
             st.session_state.pop('ppt_bytes', None)
+            st.success("Display labels applied.")
         DISPLAY_LABELS.update(st.session_state.get(label_key, {}))
 
     # --- STEP 2: ANALYSIS SELECTION ---
@@ -789,7 +864,19 @@ if uploaded_file:
     analysis_types = st.sidebar.multiselect("Choose Analyses", analysis_options, default=[], placeholder="Choose options...")
 
     if target and features and analysis_types:
+        working_df, input_issues = numeric_model_inputs(working_df, [target] + features)
+        if input_issues:
+            st.error("The target and explanatory variables must contain numeric data. Text Product IDs, Panelist IDs and filter questions are supported when used only for grouping/filtering. Correct or deselect the variables below.")
+            st.dataframe(pd.DataFrame(input_issues), hide_index=True, use_container_width=True)
+            st.stop()
         data = working_df[[target] + features].dropna()
+        if len(data) < len(features) + 2:
+            st.warning(f"Not enough complete numeric rows: {len(data)} available; at least {len(features) + 2} required. Adjust the filter or selected drivers.")
+            st.stop()
+        constant_columns = [v for v in [target] + features if data[v].nunique() < 2]
+        if constant_columns:
+            st.warning("These variables have no variation in the complete analysis data: " + ', '.join(constant_columns) + ". Adjust your selection or filter.")
+            st.stop()
         y = data[target]
         X = data[features]
         X_with_const = sm.add_constant(X)
