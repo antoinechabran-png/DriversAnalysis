@@ -7,12 +7,8 @@ import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
 from semopy import Model
-try:
-    from semopy import calc_stats as semopy_calc_stats
-    SEMOPY_STATS_AVAILABLE = True
-except ImportError:
-    SEMOPY_STATS_AVAILABLE = False
 import re
+import hashlib
 from scipy import stats
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
@@ -35,35 +31,73 @@ st.set_page_config(page_title="Consumer Driver Analysis Tool", layout="wide")
 # HELPER FUNCTIONS
 # =============================================================================
 
+
+# Display labels never change the columns supplied to statistical models.
+DISPLAY_LABELS = {}
+
+def display_label(value):
+    return DISPLAY_LABELS.get(value, value) if isinstance(value, str) else value
+
+def display_table(frame):
+    result = frame.copy()
+    for column in ('Driver', 'Attribute', 'lval', 'rval'):
+        if column in result:
+            result[column] = result[column].map(display_label)
+    if result.index.name == 'Attribute':
+        result.index = result.index.map(display_label)
+    return result
+
+def display_plot(fig, **kwargs):
+    # Keep categorical coordinates unchanged, even when two labels are identical.
+    categories = []
+    for trace in fig.data:
+        if trace.type == 'bar' and trace.orientation == 'h':
+            categories.extend(list(trace.y))
+        if trace.type == 'sankey':
+            trace.node.label = [display_label(v) for v in trace.node.label]
+        elif trace.text is not None and trace.name != 'Products':
+            if isinstance(trace.text, str):
+                trace.text = display_label(trace.text)
+            else:
+                trace.text = [display_label(v) for v in trace.text]
+    if categories:
+        categories = list(dict.fromkeys(categories))
+        fig.update_yaxes(tickmode='array', tickvals=categories,
+                         ticktext=[display_label(v) for v in categories], automargin=True)
+        for trace in fig.data:
+            if trace.type == 'bar' and trace.orientation == 'h':
+                trace.customdata = [display_label(v) for v in trace.y]
+                trace.hovertemplate = '%{customdata}<br>%{x}<extra></extra>'
+    st.plotly_chart(fig, **kwargs)
+
+def model_summary(frame, metrics=None, note=None):
+    summary_tab, = st.tabs(['Model summary'])
+    with summary_tab:
+        if metrics:
+            st.dataframe(pd.DataFrame({'Metric': list(metrics),
+                                      'Value': [str(v) for v in metrics.values()]}),
+                         hide_index=True, use_container_width=True)
+        if note:
+            st.caption(note)
+        st.dataframe(display_table(frame), use_container_width=True)
+
+def ols_metrics(fit):
+    return {'Observations': int(fit.nobs), 'R²': round(fit.rsquared, 4),
+            'Adjusted R²': round(fit.rsquared_adj, 4),
+            'F-test p-value': f'{fit.f_pvalue:.4g}'}
+
+
 def to_excel(df_dict):
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         for sheet_name, df in df_dict.items():
             if df is not None and not df.empty:
-                df.to_excel(writer, sheet_name=sheet_name, index=True)
+                display_table(df).to_excel(writer, sheet_name=sheet_name, index=True)
     return output.getvalue()
 
 
 def sanitize_name(name):
     return re.sub(r'[^a-zA-Z0-9]', '_', str(name))
-
-
-def get_label(name):
-    """Returns the user-customized display label for a variable (see the sidebar
-    'Customize chart labels' editor), or the raw column name if it hasn't been
-    relabeled. Only ever changes what's *shown* on a chart/legend — every
-    underlying dataframe (and the Excel export) still keys off the real column name."""
-    return st.session_state.get("label_map", {}).get(name, name)
-
-
-def show_model_summary(stats_dict, note=None):
-    """Renders a compact 'Metric | Value' table under a chart, summarizing the
-    model's main outputs (N, fit statistics, etc.)."""
-    summary_df = pd.DataFrame({"Metric": list(stats_dict.keys()), "Value": [str(v) for v in stats_dict.values()]})
-    st.markdown("**📋 Model summary**")
-    st.table(summary_df.set_index("Metric"))
-    if note:
-        st.caption(note)
 
 
 def run_rwa(X, y):
@@ -171,14 +205,10 @@ def bootstrap_weights(X, y, method_func, n_boot=500, cluster_ids=None):
 
 
 def render_bootstrap_bar(df, value_col, driver_col, bar_colors, title, key_prefix,
-                          X, y, method_func, panelist_col, working_df, x_index, label_map=None):
+                          X, y, method_func, panelist_col, working_df, x_index):
     """Shared UI block: checkbox to toggle bootstrap CIs, then renders either a plain
     bar chart or a bar chart with 95% CI error bars. bar_colors is a list/Series of hex
-    colors aligned to df's row order (see signed_strength_color / share_strength_color).
-    label_map (optional) remaps driver_col values to custom display labels for the
-    y-axis only — df itself keeps the original names, so exports/lookups are unaffected."""
-    lm = label_map or {}
-    y_labels = df[driver_col].map(lambda v: lm.get(v, v))
+    colors aligned to df's row order (see signed_strength_color / share_strength_color)."""
     enable_boot = st.checkbox("🔁 Compute Bootstrap Confidence Intervals", key=f"{key_prefix}_boot")
     if enable_boot:
         n_boot = st.slider("Number of bootstrap resamples", 100, 2000, 500, step=100, key=f"{key_prefix}_nboot")
@@ -187,9 +217,9 @@ def render_bootstrap_bar(df, value_col, driver_col, bar_colors, title, key_prefi
             boot_df = bootstrap_weights(X, y, method_func, n_boot=n_boot, cluster_ids=cluster_ids)
         if boot_df.empty:
             st.warning("Bootstrap did not produce valid resamples (data may be too small/collinear). Showing point estimates only.")
-            fig = go.Figure(go.Bar(x=df[value_col], y=y_labels, orientation='h', marker_color=bar_colors))
+            fig = go.Figure(go.Bar(x=df[value_col], y=df[driver_col], orientation='h', marker_color=bar_colors))
             fig.update_layout(height=450, xaxis_title=value_col)
-            st.plotly_chart(fig, use_container_width=True)
+            display_plot(fig, use_container_width=True)
             return df
         ci_lower = boot_df.quantile(0.025)
         ci_upper = boot_df.quantile(0.975)
@@ -198,21 +228,21 @@ def render_bootstrap_bar(df, value_col, driver_col, bar_colors, title, key_prefi
         df['CI Upper'] = df[driver_col].map(ci_upper)
         fig = go.Figure()
         fig.add_trace(go.Bar(
-            x=df[value_col], y=y_labels, orientation='h',
+            x=df[value_col], y=df[driver_col], orientation='h',
             error_x=dict(type='data', symmetric=False,
                          array=(df['CI Upper'] - df[value_col]).clip(lower=0),
                          arrayminus=(df[value_col] - df['CI Lower']).clip(lower=0)),
             marker_color=bar_colors
         ))
         fig.update_layout(title=f"{title} with 95% Bootstrap CI", xaxis_title=value_col, height=450)
-        st.plotly_chart(fig, use_container_width=True)
+        display_plot(fig, use_container_width=True)
         st.caption(f"Based on {len(boot_df)} successful resamples" +
                    (f", clustered by {panelist_col} (whole panelists resampled together)." if panelist_col != "None" else " (row-level resampling)."))
         return df
     else:
-        fig = go.Figure(go.Bar(x=df[value_col], y=y_labels, orientation='h', marker_color=bar_colors))
+        fig = go.Figure(go.Bar(x=df[value_col], y=df[driver_col], orientation='h', marker_color=bar_colors))
         fig.update_layout(height=450, xaxis_title=value_col)
-        st.plotly_chart(fig, use_container_width=True)
+        display_plot(fig, use_container_width=True)
         return df
 
 
@@ -453,7 +483,7 @@ def _pptx_add_header(slide, analysis_name, scope_label, n):
 
 
 def _pptx_add_bar_chart(slide, df, driver_col, value_col):
-    df = df.sort_values(by=value_col, ascending=True)  # ascending so biggest bar ends up on top
+    df = display_table(df).sort_values(by=value_col, ascending=True)  # ascending so biggest bar ends up on top
     chart_data = CategoryChartData()
     chart_data.categories = df[driver_col].astype(str).tolist()
     chart_data.add_series(value_col, df[value_col].round(3).tolist())
@@ -469,7 +499,7 @@ def _pptx_add_bar_chart(slide, df, driver_col, value_col):
 
 
 def _pptx_add_table(slide, df, max_rows=14):
-    df = df.head(max_rows)
+    df = display_table(df).head(max_rows)
     cols = list(df.columns)
     rows, ncols = len(df) + 1, len(cols)
     x, y, cx, cy = Inches(0.5), Inches(1.4), Inches(12.3), min(Inches(0.4 * rows), Inches(5.7))
@@ -729,39 +759,25 @@ if uploaded_file:
     else:
         st.sidebar.caption(f"{len(features)} selected.")
 
-    # --- STEP 1b: LABEL CUSTOMIZATION ---
-    # Lets you rename how a variable is *displayed* on every chart below (axis labels,
-    # bar labels, scatter text, Sankey nodes, tables) without touching the underlying
-    # column names — so exports and internal lookups still use the real question codes.
-    if "label_map" not in st.session_state:
-        st.session_state.label_map = {}
-
-    st.sidebar.header("1b. Customize Chart Labels")
-    with st.sidebar.expander("✏️ Rename variables for charts", expanded=False):
-        st.caption("Edit the 'Display label' column below to change how a variable's name "
-                   "appears on charts. Leave it as-is (or clear it) to use the original name.")
-        label_vars = list(dict.fromkeys(([target] if target else []) + features))  # de-dupe, keep order
-        if label_vars:
-            label_edit_df = pd.DataFrame({
-                "Variable": label_vars,
-                "Display label": [st.session_state.label_map.get(v, v) for v in label_vars]
-            })
-            edited_labels = st.data_editor(
-                label_edit_df, hide_index=True,
-                column_config={
-                    "Variable": st.column_config.TextColumn("Original name", disabled=True),
-                    "Display label": st.column_config.TextColumn("Display label"),
-                },
-                use_container_width=True, key="label_editor"
-            )
-            for _, row in edited_labels.iterrows():
-                new_label = str(row["Display label"]).strip()
-                if new_label and new_label != row["Variable"]:
-                    st.session_state.label_map[row["Variable"]] = new_label
-                elif row["Variable"] in st.session_state.label_map:
-                    del st.session_state.label_map[row["Variable"]]
-        else:
-            st.caption("Select a target and at least one driver above first.")
+    # Scope edits to file contents and sheet; preserve them across model/filter changes.
+    label_scope = hashlib.sha256(uploaded_file.getvalue() + selected_sheet.encode()).hexdigest()[:16]
+    with st.expander("Edit explanatory variable labels", expanded=False):
+        st.caption("Edit Display label, then click Apply labels. Labels apply to all charts, tables, insights and exports. Blank labels use the variable name. Model syntax keeps the original variable names.")
+        label_key = f"display_labels_{label_scope}"
+        saved_labels = st.session_state.get(label_key, {})
+        with st.form(f"label_form_{label_scope}"):
+            label_rows = pd.DataFrame({'Variable': available_drivers,
+                'Display label': [saved_labels.get(v, v) for v in available_drivers]})
+            label_edits = st.data_editor(label_rows, disabled=['Variable'], hide_index=True,
+                use_container_width=True, key=f"label_editor_{label_scope}")
+            apply_labels = st.form_submit_button("Apply labels")
+        if apply_labels:
+            st.session_state[label_key] = {
+                row['Variable']: (str(row['Display label']).strip()
+                    if pd.notna(row['Display label']) and str(row['Display label']).strip()
+                    else row['Variable']) for _, row in label_edits.iterrows()}
+            st.session_state.pop('ppt_bytes', None)
+        DISPLAY_LABELS.update(st.session_state.get(label_key, {}))
 
     # --- STEP 2: ANALYSIS SELECTION ---
     st.sidebar.header("2. Analysis Selection")
@@ -784,7 +800,7 @@ if uploaded_file:
         significant = p_values[p_values < 0.05].sort_values()
         if not significant.empty:
             for var, pval in significant.items():
-                st.markdown(f"- ✅ **{var}** (p-value: {pval:.4f})")
+                st.markdown(f"- ✅ **{display_label(var)}** (p-value: {pval:.4f})")
         else:
             st.write("No variables reached significance for this sub-target.")
         st.caption("This summary reflects the Step 0 sub-target filter only, across all products. "
@@ -816,17 +832,11 @@ if uploaded_file:
                             "🟢 green = helps liking · 🔴 red = hurts liking · shade = strength "
                             "(light < 0.3, medium < 0.5, dark ≥ 0.5) · gray = negligible (< 0.1)."
                         )
-                        fig = go.Figure(go.Bar(x=reg_df['Impact Score'], y=reg_df['Driver'].map(get_label), orientation='h', marker_color=bar_colors))
+                        fig = go.Figure(go.Bar(x=reg_df['Impact Score'], y=reg_df['Driver'], orientation='h', marker_color=bar_colors))
                         fig.update_layout(height=450, xaxis_title='Impact Score')
-                        st.plotly_chart(fig, use_container_width=True)
-                        show_model_summary({
-                            "N (observations)": int(tab_model.nobs),
-                            "# Drivers": len(features),
-                            "R²": f"{tab_model.rsquared:.3f}",
-                            "Adjusted R²": f"{tab_model.rsquared_adj:.3f}",
-                            "F-statistic": f"{tab_model.fvalue:.2f}",
-                            "Prob (F-statistic)": f"{tab_model.f_pvalue:.4f}",
-                        })
+                        display_plot(fig, use_container_width=True)
+                        reg_df['p-value'] = reg_df['Driver'].map(tab_model.pvalues)
+                        model_summary(reg_df, ols_metrics(tab_model))
                         reg_df['Product Filter'] = product_choice
                         results_to_export["Regression"] = reg_df
 
@@ -851,16 +861,9 @@ if uploaded_file:
                             rwa_df, 'Weight (%)', 'Driver', bar_colors,
                             "RWA Weights", "rwa", tab_X, tab_y,
                             lambda Xb, yb: run_rwa(Xb, yb).set_index('Driver')['Weight (%)'],
-                            panelist_col, tab_df, tab_X.index,
-                            label_map=st.session_state.label_map
+                            panelist_col, tab_df, tab_X.index
                         )
-                        full_r2 = sm.OLS(tab_y, sm.add_constant(tab_X)).fit().rsquared
-                        show_model_summary({
-                            "N (observations)": len(tab_data),
-                            "# Drivers": len(features),
-                            "Model R² (decomposed by RWA)": f"{full_r2:.3f}",
-                            "Sum of weights": f"{rwa_df['Weight (%)'].sum():.1f}%",
-                        })
+                        model_summary(rwa_df, ols_metrics(sm.OLS(tab_y, sm.add_constant(tab_X)).fit()), 'Relative weights with direction from simple correlations.')
                         rwa_df['Product Filter'] = product_choice
                         results_to_export["RWA"] = rwa_df
 
@@ -890,16 +893,9 @@ if uploaded_file:
                             shap_df, 'Importance (%)', 'Driver', bar_colors,
                             "Shapley-style Importance", "shap", tab_X, tab_y,
                             lambda Xb, yb: compute_shapley_like(Xb, yb)[0],
-                            panelist_col, tab_df, tab_X.index,
-                            label_map=st.session_state.label_map
+                            panelist_col, tab_df, tab_X.index
                         )
-                        full_model = sm.OLS(tab_y, sm.add_constant(tab_X)).fit()
-                        show_model_summary({
-                            "N (observations)": len(tab_data),
-                            "# Drivers": len(features),
-                            "Model R²": f"{full_model.rsquared:.3f}",
-                            "Sum of importance": f"{shap_df['Importance (%)'].sum():.1f}%",
-                        })
+                        model_summary(shap_df, ols_metrics(sm.OLS(tab_y, sm.add_constant(tab_X)).fit()), 'Pseudo-Shapley: absolute standardized coefficients rescaled to 100%; not an exact Shapley decomposition of R².')
                         shap_df['Product Filter'] = product_choice
                         results_to_export["Shapley"] = shap_df
 
@@ -981,7 +977,7 @@ if uploaded_file:
                                     continue
                                 fig.add_trace(go.Scatter(
                                     x=sub['% Checked'], y=sub['Impact on Liking'], mode='markers+text',
-                                    text=sub['Attribute'].map(get_label), textposition='top center',
+                                    text=sub['Attribute'], textposition='top center',
                                     marker=dict(size=(10 + sub['% Checked'] * 0.6).clip(upper=45), color=segment_colors[seg]),
                                     name=seg
                                 ))
@@ -989,17 +985,12 @@ if uploaded_file:
                             fig.update_layout(
                                 title=f"CATA Penalty Map — {product_choice}",
                                 xaxis_title="% of consumers who checked this attribute (bigger bubble = more people)",
-                                yaxis_title=f"Impact on {get_label(target)} (checked vs. not checked)",
+                                yaxis_title=f"Impact on {target} (checked vs. not checked)",
                                 xaxis_range=[0, x_max], yaxis_range=[y_bottom, y_top],
                                 height=550
                             )
-                            st.plotly_chart(fig, use_container_width=True)
-                            show_model_summary({
-                                "N (respondents)": len(tab_data),
-                                "# Attributes analyzed": len(pen_df),
-                                "# Significant (p<0.05)": int(pen_df['Significant'].sum()),
-                                "Reach threshold used": f"{reach_threshold_cata}%",
-                            })
+                            display_plot(fig, use_container_width=True)
+                            model_summary(pen_df, {"Product filter": product_choice})
 
                             with st.expander("❓ How to read this chart"):
                                 st.markdown(
@@ -1032,10 +1023,10 @@ if uploaded_file:
                                     txt = f"widely checked, but doesn't move {target} either way ({pval_txt}). It's expected/assumed rather than a differentiator."
                                 else:
                                     txt = f"rarely checked and no confirmed effect on {target} ({pval_txt}). Safe to deprioritize."
-                                st.markdown(f"{seg} **{get_label(row['Attribute'])}**: {pct:.0f}% of consumers checked it, and it {txt}")
+                                st.markdown(f"{seg} **{display_label(row['Attribute'])}**: {pct:.0f}% of consumers checked it, and it {txt}")
 
                             with st.expander("📋 Full statistical detail"):
-                                st.dataframe(pen_df.style.format({'% Checked': '{:.1f}', 'Impact on Liking': '{:.3f}', 'p-value': '{:.4f}'}))
+                                st.dataframe(display_table(pen_df).style.format({'% Checked': '{:.1f}', 'Impact on Liking': '{:.3f}', 'p-value': '{:.4f}'}))
 
                             pen_df['Product Filter'] = product_choice
                             results_to_export["Penalty"] = pen_df
@@ -1045,7 +1036,7 @@ if uploaded_file:
                     st.caption("Select the attributes that were measured on a JAR-type scale (Too Weak ↔ Just About Right ↔ Too Strong).")
                     product_choice = product_filter_ui(working_df, product_col, "jar")
                     tab_df = apply_product_filter(working_df, product_col, product_choice)
-                    jar_attrs = st.multiselect("Select JAR-type Attributes", features, key="jar_attrs")
+                    jar_attrs = st.multiselect("Select JAR-type Attributes", features, format_func=display_label, key="jar_attrs")
                     scale_type = st.radio(
                         "JAR Scale Format",
                         ["3-point (1=Too Weak, 2=JAR, 3=Too Strong)", "5-point (1-2=Too Weak, 3=JAR, 4-5=Too Strong)"],
@@ -1140,7 +1131,7 @@ if uploaded_file:
                                     continue
                                 fig.add_trace(go.Scatter(
                                     x=sub['% Selecting'], y=sub['Impact on Liking'], mode='markers+text',
-                                    text=sub['Attribute'].map(get_label) + " (" + sub['Direction'].astype(str) + ")",
+                                    text=sub['Attribute'].map(display_label) + " (" + sub['Direction'].astype(str) + ")",
                                     textposition='top center',
                                     marker=dict(size=(10 + sub['% Selecting'] * 0.6).clip(upper=45), color=verdict_colors[verdict]),
                                     name=verdict
@@ -1149,17 +1140,12 @@ if uploaded_file:
                             fig.update_layout(
                                 title=f"JAR Penalty Chart — {product_choice} — where to focus first",
                                 xaxis_title="% of consumers who said this (bigger bubble = more people)",
-                                yaxis_title=f"Impact on {get_label(target)} (higher = hurts liking more)",
+                                yaxis_title=f"Impact on {target} (higher = hurts liking more)",
                                 xaxis_range=[0, x_max], yaxis_range=[y_bottom, y_top],
                                 height=550
                             )
-                            st.plotly_chart(fig, use_container_width=True)
-                            show_model_summary({
-                                "N (base sample)": len(tab_df),
-                                "# JAR attributes analyzed": len(jar_attrs),
-                                "# Priority fixes": int((jar_df['Verdict'] == "🔴 Priority fix").sum()),
-                                "Reach threshold used": f"{reach_threshold}%",
-                            })
+                            display_plot(fig, use_container_width=True)
+                            model_summary(jar_df, {"Product filter": product_choice})
 
                             with st.expander("❓ How to read this chart"):
                                 st.markdown(
@@ -1187,10 +1173,10 @@ if uploaded_file:
                                     txt = f"it's a small group and not statistically confirmed (p={pval:.3f}) — safe to deprioritize."
                                 else:
                                     txt = "this group doesn't actually like the product any less for it — no action needed."
-                                st.markdown(f"{row['Verdict']} **{get_label(row['Attribute'])} — {row['Direction']}**: {pct:.0f}% of consumers say it's {direction_phrase}, and {txt}")
+                                st.markdown(f"{row['Verdict']} **{display_label(row['Attribute'])} — {row['Direction']}**: {pct:.0f}% of consumers say it's {direction_phrase}, and {txt}")
 
                             with st.expander("📋 Full statistical detail"):
-                                st.dataframe(jar_df.style.format({'% Selecting': '{:.1f}', 'Impact on Liking': '{:.3f}', 'p-value': '{:.4f}'}))
+                                st.dataframe(display_table(jar_df).style.format({'% Selecting': '{:.1f}', 'Impact on Liking': '{:.3f}', 'p-value': '{:.4f}'}))
 
                             jar_df['Product Filter'] = product_choice
                             results_to_export["JAR_Penalty"] = jar_df
@@ -1226,20 +1212,9 @@ if uploaded_file:
                             kano_list.append({'Driver': col, 'Reward Potential': reward, 'Penalty Potential': penalty, 'Category': cat})
 
                         kano_df = pd.DataFrame(kano_list)
-                        kano_df['Driver_Label'] = kano_df['Driver'].map(get_label)
-                        st.plotly_chart(px.scatter(kano_df, x='Penalty Potential', y='Reward Potential', color='Category', text='Driver_Label', title=f"Kano Map — {product_choice}"), use_container_width=True)
-                        show_model_summary({
-                            "N (observations)": len(tab_data),
-                            "# Drivers": len(features),
-                            "Delighters": int((kano_df['Category'] == "Delighter (Attractive)").sum()),
-                            "Must-haves": int((kano_df['Category'] == "Must-have (Basic)").sum()),
-                            "Linear (performance)": int((kano_df['Category'] == "Linear (Performance)").sum()),
-                            "Indifferent": int((kano_df['Category'] == "Indifferent").sum()),
-                        })
+                        display_plot(px.scatter(display_table(kano_df), x='Penalty Potential', y='Reward Potential', color='Category', text='Driver', title=f"Kano Map — {product_choice}"), use_container_width=True)
                         st.caption("Note: this is a proxy classification based on a median split of each driver, not the full Kano method (which requires paired functional/dysfunctional questions).")
-                        kano_display_df = kano_df.drop(columns=['Driver']).rename(columns={'Driver_Label': 'Driver'})
-                        st.table(kano_display_df[['Driver', 'Reward Potential', 'Penalty Potential', 'Category']])
-                        kano_df = kano_df.drop(columns=['Driver_Label'])
+                        model_summary(kano_df, {"Observations": len(tab_data)})
                         kano_df['Product Filter'] = product_choice
                         results_to_export["Kano"] = kano_df
 
@@ -1249,35 +1224,28 @@ if uploaded_file:
                     tab_df = apply_product_filter(working_df, product_col, product_choice)
                     tab_data = tab_df[[target] + features].dropna()
                     path_syntax = st.text_area("Syntax", value=f"{target} ~ {' + '.join(features)}", key="path_syntax")
-                    if st.button("Run Path Model"):
+                    path_signature = hashlib.sha256(pd.util.hash_pandas_object(tab_data, index=True).values.tobytes() + str(list(tab_data.columns)).encode() + path_syntax.encode()).hexdigest()
+                    run_path = st.button("Run Path Model")
+                    if run_path or path_signature in st.session_state.get('path_results', {}):
                         if tab_data.empty:
                             st.warning(f"⚠️ Not enough data for '{product_choice}' to run this analysis.")
                         else:
                             try:
-                                sem = Model(path_syntax)
-                                sem.fit(tab_data)
-                                res = sem.inspect()
+                                if run_path:
+                                    sem = Model(path_syntax)
+                                    sem.fit(tab_data)
+                                    st.session_state['path_results'] = {path_signature: sem.inspect()}
+                                res = st.session_state['path_results'][path_signature].copy()
                                 paths = res[res['op'] == '~']
                                 labels = list(set(paths['lval'].tolist() + paths['rval'].tolist()))
-                                display_labels = [get_label(l) for l in labels]
                                 fig = go.Figure(data=[go.Sankey(
-                                    node=dict(pad=15, thickness=20, label=display_labels, color="blue"),
+                                    node=dict(pad=15, thickness=20, label=labels, color="blue"),
                                     link=dict(source=[labels.index(x) for x in paths['rval']],
                                               target=[labels.index(x) for x in paths['lval']],
                                               value=np.abs(paths['Estimate']).tolist(),
                                               label=paths['Estimate'].round(3).astype(str).tolist()))])
-                                st.plotly_chart(fig, use_container_width=True)
-
-                                path_stats = {"N (observations)": len(tab_data), "# Paths estimated": len(paths)}
-                                if SEMOPY_STATS_AVAILABLE:
-                                    try:
-                                        fit_row = semopy_calc_stats(sem).iloc[:, 0]
-                                        path_stats.update({k: (f"{v:.3f}" if isinstance(v, (int, float)) else v)
-                                                            for k, v in fit_row.items()})
-                                    except Exception:
-                                        pass
-                                show_model_summary(path_stats)
-
+                                display_plot(fig, use_container_width=True)
+                                model_summary(res, {'Observations': len(tab_data)})
                                 res['Product Filter'] = product_choice
                                 results_to_export["Path"] = res
                             except Exception as e:
@@ -1319,35 +1287,27 @@ if uploaded_file:
 
                                 bar_colors = [signed_strength_color(v) for v in mm_df['Standardized Coefficient']]
                                 fig = go.Figure(go.Bar(
-                                    x=mm_df['Standardized Coefficient'], y=mm_df['Driver'].map(get_label), orientation='h',
+                                    x=mm_df['Standardized Coefficient'], y=mm_df['Driver'], orientation='h',
                                     marker_color=bar_colors
                                 ))
                                 fig.update_layout(height=450, xaxis_title='Standardized Coefficient',
                                                    title=f"Mixed Model Fixed Effects (Standardized) — {product_choice}")
-                                st.plotly_chart(fig, use_container_width=True)
+                                display_plot(fig, use_container_width=True)
+                                model_summary(mm_df, {'Observations': len(mm_data), 'Panelists': mm_data[panelist_col].nunique(), 'Converged': mixed_result.converged, 'Random intercept variance': round(float(mixed_result.cov_re.iloc[0, 0]), 4), 'Residual variance': round(mixed_result.scale, 4)})
                                 st.caption(
                                     "🟢 green = helps liking · 🔴 red = hurts liking · shade = strength "
                                     "(light < 0.3, medium < 0.5, dark ≥ 0.5) · gray = negligible (< 0.1)."
                                 )
 
                                 n_panelists = mm_data[panelist_col].nunique()
-                                try:
-                                    aic_val, bic_val, llf_val = f"{mixed_result.aic:.1f}", f"{mixed_result.bic:.1f}", f"{mixed_result.llf:.2f}"
-                                except Exception:
-                                    aic_val = bic_val = llf_val = "n/a"
-                                show_model_summary({
-                                    "N (observations)": len(mm_data),
-                                    "N (panelists)": n_panelists,
-                                    "# Drivers": len(features),
-                                    "Log-Likelihood": llf_val,
-                                    "AIC": aic_val,
-                                    "BIC": bic_val,
-                                })
                                 st.caption(f"Random intercept fit across {n_panelists} panelists ({len(mm_data)} total ratings).")
-                                st.dataframe(mm_df.assign(Driver=mm_df['Driver'].map(get_label)).style.format({'Standardized Coefficient': '{:.4f}', 'p-value': '{:.4f}'}))
+                                st.dataframe(display_table(mm_df).style.format({'Standardized Coefficient': '{:.4f}', 'p-value': '{:.4f}'}))
 
                                 with st.expander("Full Model Summary"):
-                                    st.text(str(mixed_result.summary()))
+                                    summary_text = str(mixed_result.summary())
+                                    for variable in sorted(DISPLAY_LABELS, key=len, reverse=True):
+                                        summary_text = re.sub(r'(?<![A-Za-z0-9_])' + re.escape(variable) + r'(?![A-Za-z0-9_])', lambda match: str(DISPLAY_LABELS[variable]), summary_text)
+                                    st.text(summary_text)
 
                                 mm_df['Product Filter'] = product_choice
                                 results_to_export["MixedModel"] = mm_df
@@ -1378,7 +1338,7 @@ if uploaded_file:
                             var_exp = pca.explained_variance_ratio_ * 100
 
                             scores_df = pd.DataFrame(scores, columns=['PC1', 'PC2'], index=product_means.index)
-                            loadings_df = pd.DataFrame(loadings, columns=['PC1', 'PC2'], index=features)
+                            loadings_df = pd.DataFrame(loadings, columns=['PC1', 'PC2'], index=pd.Index(features, name='Attribute'))
 
                             # External preference vector: regress mean liking per product on PC scores
                             # (pass pandas objects, not .values, so .params comes back as a labeled
@@ -1399,7 +1359,7 @@ if uploaded_file:
                                 fig.add_trace(go.Scatter(
                                     x=[0, loadings_df.loc[attr, 'PC1'] * scale_factor],
                                     y=[0, loadings_df.loc[attr, 'PC2'] * scale_factor],
-                                    mode='lines+text', text=[None, get_label(attr)],
+                                    mode='lines+text', text=[None, attr],
                                     line=dict(color='gray', width=1), showlegend=False
                                 ))
 
@@ -1407,7 +1367,7 @@ if uploaded_file:
                             liking_scale = np.abs(scores_df.values).max() / vec_norm * 0.9
                             fig.add_trace(go.Scatter(
                                 x=[0, vec_pc1 * liking_scale], y=[0, vec_pc2 * liking_scale],
-                                mode='lines+text', text=[None, f'{get_label(target)} (Liking)'],
+                                mode='lines+text', text=[None, f'{target} (Liking)'],
                                 line=dict(color='red', width=3), name='Liking Vector'
                             ))
 
@@ -1417,19 +1377,13 @@ if uploaded_file:
                                 yaxis_title=f"PC2 ({var_exp[1]:.1f}% variance)",
                                 height=650
                             )
-                            st.plotly_chart(fig, use_container_width=True)
-                            show_model_summary({
-                                "N (products)": len(product_means),
-                                "# Drivers used": len(features),
-                                "PC1 variance explained": f"{var_exp[0]:.1f}%",
-                                "PC2 variance explained": f"{var_exp[1]:.1f}%",
-                                "Total (PC1+PC2)": f"{var_exp[0] + var_exp[1]:.1f}%",
-                                "Liking vector R²": f"{pref_model.rsquared:.3f}",
-                            })
+                            display_plot(fig, use_container_width=True)
                             st.caption("Red arrow = direction of increasing average liking. Gray arrows = attribute loadings. "
                                        "Products lying further along the red arrow are, on average, more liked; attributes pointing "
                                        "the same way as the red arrow are generally liking-positive.")
 
+                            model_summary(loadings_df, {'Products': len(product_means), 'PC1 variance (%)': round(var_exp[0], 2), 'PC2 variance (%)': round(var_exp[1], 2), 'Preference regression R²': round(pref_model.rsquared, 4)})
+                            st.dataframe(scores_df, use_container_width=True)
                             results_to_export["PrefMap_Scores"] = scores_df
                             results_to_export["PrefMap_Loadings"] = loadings_df
 
