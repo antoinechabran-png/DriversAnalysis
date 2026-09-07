@@ -96,6 +96,16 @@ def display_table(frame):
         result.index = result.index.map(display_label)
     return result
 
+def render_chart(fig, **kwargs):
+    # Avoid wheel-zoom interception and keep chart size under user control.
+    config = dict(kwargs.pop('config', {}) or {})
+    config.update(scrollZoom=False, responsive=True, displaylogo=False)
+    original_height = fig.layout.height or 450
+    maximum_height = st.session_state.get('chart_max_height', 600)
+    fig.update_layout(height=min(original_height, maximum_height))
+    st.plotly_chart(fig, config=config, **kwargs)
+
+
 def display_plot(fig, **kwargs):
     # Keep categorical coordinates unchanged, even when two labels are identical.
     categories = []
@@ -117,7 +127,7 @@ def display_plot(fig, **kwargs):
             if trace.type == 'bar' and trace.orientation == 'h':
                 trace.customdata = [display_label(v) for v in trace.y]
                 trace.hovertemplate = '%{customdata}<br>%{x}<extra></extra>'
-    st.plotly_chart(fig, **kwargs)
+    render_chart(fig, **kwargs)
 
 
 def path_diagram(paths, outcome, coefficient_column, scope, neutral_threshold=0.05):
@@ -750,6 +760,12 @@ def product_filter_ui(working_df, product_col, key_prefix):
 # =============================================================================
 
 st.title("📊 Consumer Driver Analysis Suite")
+
+with st.sidebar.expander("Chart display", expanded=False):
+    st.slider("Maximum chart height (pixels)", min_value=350, max_value=1600,
+              value=600, step=50, key="chart_max_height",
+              help="Use a smaller height on laptop screens. Increase it for charts with many labels.")
+    st.caption("Mouse-wheel chart zoom is disabled to reduce conflicts with page scrolling. Use the chart toolbar for zoom controls where available.")
 
 uploaded_file = st.file_uploader("Upload Excel File", type="xlsx")
 
@@ -1407,7 +1423,7 @@ if uploaded_file:
                                         key=f"path_neutral_{path_signature}_{coefficient_column}",
                                         help="Grey indicates near-zero magnitude, not statistical nonsignificance. The threshold uses the selected coefficient scale.")
                                     fig = path_diagram(paths, outcome, coefficient_column, product_choice, neutral_threshold)
-                                    st.plotly_chart(fig, use_container_width=True,
+                                    render_chart(fig, use_container_width=True,
                                         config={'displaylogo': False, 'toImageButtonOptions': {'format': 'svg', 'filename': 'path_analysis'}})
                                     st.caption("Green = positive · Pink = negative · Grey = within the neutral band. Ribbon width represents the absolute coefficient, not a flow volume. Signed coefficients appear beside each attribute; hover for p-values. Exactly zero effects have no ribbon. Colour does not indicate statistical significance.")
                                     if len(outcomes) > 1:
