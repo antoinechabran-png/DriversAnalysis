@@ -451,15 +451,19 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
     for feat in features:
         p_vals = pd.to_numeric(prod_df[feat], errors='coerce').dropna()
         r_vals = pd.to_numeric(rest_df[feat], errors='coerce').dropna()
+        all_vals = pd.to_numeric(working_df[feat], errors='coerce').dropna()
+        f_min, f_max = (all_vals.min(), all_vals.max()) if not all_vals.empty else (np.nan, np.nan)
         if len(p_vals) < 2 or len(r_vals) < 2:
             pvals.append(np.nan)
-            rows.append({'Driver': feat, 'Product Mean': np.nan, 'Rest-of-Set Mean': np.nan, 'Index': np.nan})
+            rows.append({'Driver': feat, 'Product Mean': np.nan, 'Rest-of-Set Mean': np.nan, 'Index': np.nan,
+                         'Feature Min': f_min, 'Feature Max': f_max})
             continue
         p_mean, r_mean = p_vals.mean(), r_vals.mean()
         _, pval = stats.ttest_ind(p_vals, r_vals, equal_var=False)
         pvals.append(pval)
         index_val = np.nan if (pd.isna(r_mean) or r_mean == 0) else (p_mean / r_mean * 100)
-        rows.append({'Driver': feat, 'Product Mean': p_mean, 'Rest-of-Set Mean': r_mean, 'Index': index_val})
+        rows.append({'Driver': feat, 'Product Mean': p_mean, 'Rest-of-Set Mean': r_mean, 'Index': index_val,
+                     'Feature Min': f_min, 'Feature Max': f_max})
     gap_df = pd.DataFrame(rows)
 
     qvals = np.full(len(pvals), np.nan)
@@ -511,33 +515,61 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
         by=['_rank', '_sig', '_gap'], ascending=[False, False, False]).drop(columns=['_rank', '_sig', '_gap']).reset_index(drop=True)
     out.insert(0, 'Product', product)
     return out[['Product', 'Driver', 'Direction', 'Importance (%)', 'Priority', 'Whole-Sample Importance (%)',
-                'Product Mean', 'Rest-of-Set Mean', 'Gap (Product − Rest of Set)', 'Index', 'p-value',
-                'q-value (BH)', 'Significant', 'Action', 'Recommendation']]
+                'Product Mean', 'Rest-of-Set Mean', 'Gap (Product − Rest of Set)', 'Feature Min', 'Feature Max',
+                'Index', 'p-value', 'q-value (BH)', 'Significant', 'Action', 'Recommendation']]
 
 
-def recommendation_chart(reco_df, product_label):
-    """Two-bar comparison per driver: a grey bar for the rest-of-set mean score, and a second,
-    colored bar for this product's own mean score on the same attribute — so the gap is read
-    directly off the bar lengths rather than off a % index number. Bar color intensity/hue on
-    the product bar encodes driver importance and direction (green = helps liking, red = hurts
-    liking; darker = more important). ▲/▼ marks a BH-significant gap. Sorted so the highest-
-    priority drivers (importance-weighted) sit at the top."""
+def recommendation_chart(reco_df, product_label, min_gap_frac=0.045):
+    """One horizontal bar per driver — length = this product's driver importance, colored green
+    (helps liking) or red (hurts liking), darker shade = more important — ordered top-to-bottom
+    by importance, same layout language as the original Drivers-of-Liking chart. Overlaid on
+    each bar are two ticks placed on the SAME shared axis: a dark tick for the rest-of-set mean
+    score and an orange tick for this product's own score, each rescaled from that attribute's
+    own observed min–max range onto the bar's 0..max-importance width, so every row's ticks are
+    visually comparable. If the two ticks would land within min_gap_frac of the chart width from
+    each other, they're nudged apart symmetrically (their order/relative position is preserved)
+    so both stay distinguishable instead of overlapping."""
     n = len(reco_df)
-    plot_df = reco_df.sort_values(by='Importance (%)', ascending=True)  # ascending: plotly draws bottom-up
-    prod_colors = [share_strength_color(row['Importance (%)'], row['Direction'], n) for _, row in plot_df.iterrows()]
+    plot_df = reco_df.sort_values(by='Importance (%)', ascending=True).reset_index(drop=True)
+    bar_colors = [share_strength_color(row['Importance (%)'], row['Direction'], n) for _, row in plot_df.iterrows()]
+    x_max = max(plot_df['Importance (%)'].max(), 1)
+    min_gap = min_gap_frac * x_max
+
+    mean_x, cand_x, drivers = [], [], []
+    for _, row in plot_df.iterrows():
+        f_min, f_max = row['Feature Min'], row['Feature Max']
+        span = (f_max - f_min) if pd.notna(f_max) and pd.notna(f_min) and (f_max - f_min) > 0 else np.nan
+        if pd.isna(span) or pd.isna(row['Rest-of-Set Mean']) or pd.isna(row['Product Mean']):
+            mean_x.append(np.nan); cand_x.append(np.nan); drivers.append(row['Driver']); continue
+        m = np.clip((row['Rest-of-Set Mean'] - f_min) / span, 0, 1) * x_max
+        c = np.clip((row['Product Mean'] - f_min) / span, 0, 1) * x_max
+        diff = c - m
+        if abs(diff) < min_gap:
+            push = (min_gap - abs(diff)) / 2
+            if diff >= 0:
+                c, m = min(c + push, x_max), max(m - push, 0)
+            else:
+                c, m = max(c - push, 0), min(m + push, x_max)
+        mean_x.append(m); cand_x.append(c); drivers.append(row['Driver'])
 
     fig = go.Figure()
     fig.add_trace(go.Bar(
-        x=plot_df['Rest-of-Set Mean'], y=plot_df['Driver'], orientation='h',
-        marker_color='#C9CDD3', name='Rest of set (mean)',
-        hovertemplate='%{y}<br>Rest-of-set mean: %{x:.2f}<extra></extra>'
+        x=plot_df['Importance (%)'], y=plot_df['Driver'], orientation='h',
+        marker_color=bar_colors, name=str(product_label) + ' — driver importance', width=0.55,
+        hovertemplate='%{y}<br>Importance: %{x:.1f}%<extra></extra>'
     ))
-    fig.add_trace(go.Bar(
-        x=plot_df['Product Mean'], y=plot_df['Driver'], orientation='h',
-        marker_color=prod_colors, name=str(product_label),
-        hovertemplate='%{y}<br>' + str(product_label) + ': %{x:.2f}<extra></extra>'
+    fig.add_trace(go.Scatter(
+        x=mean_x, y=drivers, mode='markers', name='Rest of set (mean)',
+        marker=dict(symbol='line-ns', size=20, line=dict(width=3, color='#333333')),
+        customdata=plot_df['Rest-of-Set Mean'],
+        hovertemplate='%{y}<br>Rest-of-set mean score: %{customdata:.2f}<extra></extra>'
     ))
-    x_max = max(plot_df['Rest-of-Set Mean'].max(skipna=True) or 0, plot_df['Product Mean'].max(skipna=True) or 0, 1)
+    fig.add_trace(go.Scatter(
+        x=cand_x, y=drivers, mode='markers', name=str(product_label),
+        marker=dict(symbol='line-ns', size=20, line=dict(width=3, color='#FF8C00')),
+        customdata=plot_df['Product Mean'],
+        hovertemplate='%{y}<br>' + str(product_label) + ' score: %{customdata:.2f}<extra></extra>'
+    ))
     for _, row in plot_df.iterrows():
         idx, sig = row['Index'], row['Significant']
         if pd.isna(idx) or pd.isna(sig):
@@ -548,9 +580,9 @@ def recommendation_chart(reco_df, product_label):
             fig.add_annotation(x=x_max * 1.04, y=row['Driver'], text=f"<b>{arrow}</b>", showarrow=False,
                                 xanchor='left', font=dict(color=color, size=16))
     fig.update_layout(
-        barmode='group', bargap=0.28, bargroupgap=0.08,
-        title=f"Attribute Scores — {product_label} vs. Rest of Set",
-        xaxis_title='Mean score', height=max(340, 40 * n), margin=dict(r=55, l=10, t=60, b=40),
+        title=f"Drivers of Liking — {product_label}", height=max(340, 42 * n),
+        xaxis_title='Importance (%)  ·  ticks = attribute score, rescaled to this width',
+        margin=dict(r=55, l=10, t=60, b=40),
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1))
     return fig
 
@@ -1750,9 +1782,11 @@ if uploaded_file:
                             else:
                                 display_plot(recommendation_chart(reco_df, focus_product), use_container_width=True)
                                 st.caption(
-                                    "Grey bar = rest-of-set mean score on that attribute. Colored bar = this product's own "
-                                    "mean score (green = attribute helps liking, red = attribute hurts liking; darker shade = "
-                                    "more important driver). ▲▼ marks a gap that survives Benjamini-Hochberg correction."
+                                    "Bar length = this product's driver importance (green = helps liking, red = hurts liking; "
+                                    "darker = more important). The two ticks on each bar show where the **rest-of-set mean** "
+                                    "(dark tick) and **this product** (orange tick) sit on that attribute's own scale — rescaled "
+                                    "row-by-row so they're readable, and nudged apart automatically if they'd otherwise overlap. "
+                                    "▲▼ marks a gap that survives Benjamini-Hochberg correction. Hover a tick for the exact score."
                                 )
 
                                 st.markdown(f"##### Recommended actions — {focus_product}")
