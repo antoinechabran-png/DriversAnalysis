@@ -423,12 +423,21 @@ def calc_driver_importance(tab_df, target, features, method="Shapley Values"):
 
 
 def calc_product_recommendations(working_df, product_col, product, target, features,
-                                   method="Shapley Values", alpha=0.05, min_n=5):
-    """Crosses driver importance (recomputed on this product's own respondents) against how
-    the product over/under-indexes on each attribute vs the rest of the product set, to turn
-    every driver into a concrete increase / maintain / reduce recommendation.
+                                   method="Shapley Values", alpha=0.05, min_n=5,
+                                   importance_scope="Total Set"):
+    """Crosses driver importance against how the product over/under-indexes on each attribute
+    vs the rest of the product set, to turn every driver into a concrete increase / maintain /
+    reduce recommendation.
 
-    - Importance & Direction: from `method`, run on this product's subset only.
+    - Importance & Direction: from `method`, and from `importance_scope`:
+        "Total Set"    — importance/direction estimated once on the WHOLE sample (all products
+                         together). Same ranking used for every product; only the gap side of
+                         the analysis changes product to product. This is the default, since
+                         importance from a single product's data alone can be noisy/unstable
+                         when that product has a small N.
+        "Product Itself" — importance/direction re-estimated on THIS product's own respondents
+                         only ("intra" drivers) — what matters for liking within this product
+                         specifically, which can differ from what matters across the set.
     - Index: this product's mean on the attribute vs the mean of every OTHER product's
       respondents (100 = same as the rest of the set).
     - Significance: Welch's t-test per driver, Benjamini-Hochberg corrected across drivers.
@@ -445,7 +454,8 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
     all_importance = calc_driver_importance(working_df, target, features, method)
     if prod_importance is None or all_importance is None:
         return None
-    tick = all_importance.set_index('Driver')['Importance (%)']
+    importance_used = all_importance if importance_scope == "Total Set" else prod_importance
+    other_scope_tick = (prod_importance if importance_scope == "Total Set" else all_importance).set_index('Driver')['Importance (%)']
 
     rows, pvals = [], []
     for feat in features:
@@ -476,8 +486,9 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
     gap_df['q-value (BH)'] = qvals
     gap_df['Significant'] = gap_df['q-value (BH)'] < alpha
 
-    out = prod_importance.merge(gap_df, on='Driver', how='left')
-    out['Whole-Sample Importance (%)'] = out['Driver'].map(tick)
+    out = importance_used.merge(gap_df, on='Driver', how='left')
+    out['Importance Scope'] = importance_scope
+    out['Importance (%) — Other Scope'] = out['Driver'].map(other_scope_tick)
     out['Gap (Product − Rest of Set)'] = out['Product Mean'] - out['Rest-of-Set Mean']
     equal_share = 100.0 / max(len(features), 1)
     out['Priority'] = np.select(
@@ -514,8 +525,9 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
                       _gap=out['Gap (Product − Rest of Set)'].abs()).sort_values(
         by=['_rank', '_sig', '_gap'], ascending=[False, False, False]).drop(columns=['_rank', '_sig', '_gap']).reset_index(drop=True)
     out.insert(0, 'Product', product)
-    return out[['Product', 'Driver', 'Direction', 'Importance (%)', 'Priority', 'Whole-Sample Importance (%)',
-                'Product Mean', 'Rest-of-Set Mean', 'Gap (Product − Rest of Set)', 'Feature Min', 'Feature Max',
+    return out[['Product', 'Driver', 'Direction', 'Importance Scope', 'Importance (%)', 'Priority',
+                'Importance (%) — Other Scope', 'Product Mean', 'Rest-of-Set Mean',
+                'Gap (Product − Rest of Set)', 'Feature Min', 'Feature Max',
                 'Index', 'p-value', 'q-value (BH)', 'Significant', 'Action', 'Recommendation']]
 
 
@@ -579,8 +591,10 @@ def recommendation_chart(reco_df, product_label, min_gap_frac=0.045):
             color = '#16845B' if arrow == '▲' else '#CC3975'
             fig.add_annotation(x=x_max * 1.04, y=row['Driver'], text=f"<b>{arrow}</b>", showarrow=False,
                                 xanchor='left', font=dict(color=color, size=16))
+    scope_note = plot_df['Importance Scope'].iloc[0] if 'Importance Scope' in plot_df.columns and n else ''
     fig.update_layout(
-        title=f"Drivers of Liking — {product_label}", height=max(340, 42 * n),
+        title=f"Drivers of Liking — {product_label}" + (f"  (importance: {scope_note})" if scope_note else ''),
+        height=max(340, 42 * n),
         xaxis_title='Importance (%)  ·  ticks = attribute score, rescaled to this width',
         margin=dict(r=55, l=10, t=60, b=40),
         legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1))
@@ -1749,24 +1763,38 @@ if uploaded_file:
                 elif analysis == "Product Recommendations":
                     st.subheader("📌 Product Recommendations — Drivers × Performance")
                     st.caption(
-                        "For each product, crosses driver importance (recomputed on that product's own respondents) "
-                        "against how the product over/under-indexes on each attribute vs the rest of the set, "
-                        "to turn every driver into a concrete increase / maintain / reduce recommendation."
+                        "For each product, crosses driver importance against how the product over/under-indexes on "
+                        "each attribute vs the rest of the set, to turn every driver into a concrete increase / "
+                        "maintain / reduce recommendation."
                     )
                     if product_col == "None":
                         st.warning("⚠️ Set a **Product ID column** in the sidebar → Step 1 to use this module — "
                                     "it needs to know which rows belong to which product to compare one against the rest.")
                     else:
-                        c1, c2 = st.columns(2)
+                        c1, c2, c3 = st.columns(3)
                         with c1:
-                            reco_method = st.selectbox(
-                                "Importance method (recomputed per product)",
-                                ["Shapley Values", "RWA", "Standardized Regression"], key="reco_method"
+                            reco_scope = st.selectbox(
+                                "Driver importance from",
+                                ["Total Set", "Product Itself"], key="reco_scope",
+                                help="Total Set (default): importance/direction estimated once on the whole sample, "
+                                     "so every product is ranked against the same driver hierarchy — more stable, "
+                                     "recommended when a product has a smallish N. Product Itself: importance/"
+                                     "direction re-estimated only on this product's own respondents ('intra' "
+                                     "drivers) — what matters for liking within this product specifically, which "
+                                     "can differ from the total-set picture."
                             )
                         with c2:
+                            reco_method = st.selectbox(
+                                "Importance method",
+                                ["Shapley Values", "RWA", "Standardized Regression"], key="reco_method"
+                            )
+                        with c3:
                             reco_alpha = st.number_input(
                                 "Significance threshold (BH-adjusted α)", 0.01, 0.20, 0.05, step=0.01, key="reco_alpha"
                             )
+                        st.caption(f"Driver importance currently comes from: **{reco_scope}**"
+                                   + (" — recomputed separately for each product below." if reco_scope == "Product Itself"
+                                      else " — one ranking, shared by every product below."))
 
                         all_products = sorted(working_df[product_col].dropna().astype(str).unique().tolist())
                         if len(all_products) < 2:
@@ -1775,7 +1803,7 @@ if uploaded_file:
                             focus_product = st.selectbox("Focus product", all_products, key="reco_focus_product")
                             reco_df = calc_product_recommendations(
                                 working_df, product_col, focus_product, target, features,
-                                method=reco_method, alpha=reco_alpha
+                                method=reco_method, alpha=reco_alpha, importance_scope=reco_scope
                             )
                             if reco_df is None:
                                 st.warning(f"⚠️ Not enough data for '{focus_product}' (or the rest of the set) to run this analysis.")
@@ -1801,7 +1829,7 @@ if uploaded_file:
 
                                 with st.expander("Full statistical detail (p-values, index, BH q-values)"):
                                     reco_display = reco_df.drop(columns=['Product']).copy()
-                                    for col in ('Importance (%)', 'Whole-Sample Importance (%)', 'Product Mean',
+                                    for col in ('Importance (%)', 'Importance (%) — Other Scope', 'Product Mean',
                                                 'Rest-of-Set Mean', 'Gap (Product − Rest of Set)', 'Index'):
                                         reco_display[col] = reco_display[col].round(2)
                                     reco_display['p-value'] = reco_display['p-value'].map(lambda v: f'{v:.4g}' if pd.notna(v) else '')
@@ -1816,7 +1844,8 @@ if uploaded_file:
                                     all_reco = [r for p in all_products
                                                 if (r := calc_product_recommendations(
                                                         working_df, product_col, p, target, features,
-                                                        method=reco_method, alpha=reco_alpha)) is not None]
+                                                        method=reco_method, alpha=reco_alpha,
+                                                        importance_scope=reco_scope)) is not None]
                                 st.session_state['reco_full_table'] = pd.concat(all_reco, ignore_index=True) if all_reco else None
 
                             full_reco = st.session_state.get('reco_full_table')
