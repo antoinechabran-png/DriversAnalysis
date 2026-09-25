@@ -12,6 +12,7 @@ import hashlib
 import textwrap
 import html
 from scipy import stats
+from statsmodels.stats.multitest import multipletests
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
@@ -96,16 +97,6 @@ def display_table(frame):
         result.index = result.index.map(display_label)
     return result
 
-def render_chart(fig, **kwargs):
-    # Avoid wheel-zoom interception and keep chart size under user control.
-    config = dict(kwargs.pop('config', {}) or {})
-    config.update(scrollZoom=False, responsive=True, displaylogo=False)
-    original_height = fig.layout.height or 450
-    maximum_height = st.session_state.get('chart_max_height', 600)
-    fig.update_layout(height=min(original_height, maximum_height))
-    st.plotly_chart(fig, config=config, **kwargs)
-
-
 def display_plot(fig, **kwargs):
     # Keep categorical coordinates unchanged, even when two labels are identical.
     categories = []
@@ -127,7 +118,7 @@ def display_plot(fig, **kwargs):
             if trace.type == 'bar' and trace.orientation == 'h':
                 trace.customdata = [display_label(v) for v in trace.y]
                 trace.hovertemplate = '%{customdata}<br>%{x}<extra></extra>'
-    render_chart(fig, **kwargs)
+    st.plotly_chart(fig, **kwargs)
 
 
 def path_diagram(paths, outcome, coefficient_column, scope, neutral_threshold=0.05):
@@ -405,6 +396,143 @@ def calc_shapley(tab_df, target, features):
         'Importance (%)': shap_pct.values,
         'Direction': np.where(raw_std_coefs.values > 0, 'Positive', 'Negative')
     }).sort_values(by='Importance (%)', ascending=False)
+
+
+def calc_driver_importance(tab_df, target, features, method="Shapley Values"):
+    """Unifies the three importance methods into one 'Driver / Importance (%) / Direction'
+    shape so the recommendation module can swap between them freely."""
+    if method == "RWA":
+        res = calc_rwa(tab_df, target, features)
+        if res is None:
+            return None
+        return res.rename(columns={'Weight (%)': 'Importance (%)'})[['Driver', 'Importance (%)', 'Direction']]
+    elif method == "Standardized Regression":
+        res = calc_linear_regression(tab_df, target, features)
+        if res is None:
+            return None
+        total = res['Impact Score'].abs().sum()
+        res = res.copy()
+        res['Importance (%)'] = (res['Impact Score'].abs() / total * 100) if total > 0 else 0.0
+        res['Direction'] = np.where(res['Impact Score'] > 0, 'Positive', 'Negative')
+        return res[['Driver', 'Importance (%)', 'Direction']]
+    else:  # "Shapley Values"
+        res = calc_shapley(tab_df, target, features)
+        if res is None:
+            return None
+        return res[['Driver', 'Importance (%)', 'Direction']]
+
+
+def calc_product_recommendations(working_df, product_col, product, target, features,
+                                   method="Shapley Values", alpha=0.05, min_n=5):
+    """Crosses driver importance (recomputed on this product's own respondents) against how
+    the product over/under-indexes on each attribute vs the rest of the product set, to turn
+    every driver into a concrete increase / maintain / reduce recommendation.
+
+    - Importance & Direction: from `method`, run on this product's subset only.
+    - Index: this product's mean on the attribute vs the mean of every OTHER product's
+      respondents (100 = same as the rest of the set).
+    - Significance: Welch's t-test per driver, Benjamini-Hochberg corrected across drivers.
+
+    Returns None when there isn't enough data (either side of the split) to run it.
+    """
+    prod_mask = working_df[product_col].astype(str) == str(product)
+    prod_df = working_df.loc[prod_mask]
+    rest_df = working_df.loc[~prod_mask]
+    if len(prod_df) < min_n or len(rest_df) < min_n:
+        return None
+
+    prod_importance = calc_driver_importance(prod_df, target, features, method)
+    all_importance = calc_driver_importance(working_df, target, features, method)
+    if prod_importance is None or all_importance is None:
+        return None
+    tick = all_importance.set_index('Driver')['Importance (%)']
+
+    rows, pvals = [], []
+    for feat in features:
+        p_vals = pd.to_numeric(prod_df[feat], errors='coerce').dropna()
+        r_vals = pd.to_numeric(rest_df[feat], errors='coerce').dropna()
+        if len(p_vals) < 2 or len(r_vals) < 2:
+            pvals.append(np.nan)
+            rows.append({'Driver': feat, 'Product Mean': np.nan, 'Rest-of-Set Mean': np.nan, 'Index': np.nan})
+            continue
+        p_mean, r_mean = p_vals.mean(), r_vals.mean()
+        _, pval = stats.ttest_ind(p_vals, r_vals, equal_var=False)
+        pvals.append(pval)
+        index_val = np.nan if (pd.isna(r_mean) or r_mean == 0) else (p_mean / r_mean * 100)
+        rows.append({'Driver': feat, 'Product Mean': p_mean, 'Rest-of-Set Mean': r_mean, 'Index': index_val})
+    gap_df = pd.DataFrame(rows)
+
+    qvals = np.full(len(pvals), np.nan)
+    valid_idx = [i for i, v in enumerate(pvals) if pd.notna(v)]
+    if valid_idx:
+        _, q_valid, _, _ = multipletests([pvals[i] for i in valid_idx], alpha=alpha, method='fdr_bh')
+        for pos, i in enumerate(valid_idx):
+            qvals[i] = q_valid[pos]
+    gap_df['p-value'] = pvals
+    gap_df['q-value (BH)'] = qvals
+    gap_df['Significant'] = gap_df['q-value (BH)'] < alpha
+
+    out = prod_importance.merge(gap_df, on='Driver', how='left')
+    out['Whole-Sample Importance (%)'] = out['Driver'].map(tick)
+    equal_share = 100.0 / max(len(features), 1)
+
+    def recommend(row):
+        if pd.isna(row['Index']) or pd.isna(row['Significant']):
+            return '⚪ Insufficient data'
+        priority = ('High' if row['Importance (%)'] >= 1.5 * equal_share
+                    else 'Medium' if row['Importance (%)'] >= 0.5 * equal_share else 'Low')
+        if not row['Significant']:
+            return f'⚪ {priority}-importance — no significant gap vs rest of set'
+        if row['Direction'] == 'Positive':
+            return (f'🟢 {priority}-priority OPPORTUNITY — increase (helps liking, under-delivered here)' if row['Index'] < 100
+                    else f'✅ {priority}-priority STRENGTH — maintain / lead with it (helps liking, over-delivered)')
+        else:
+            return (f'🔴 {priority}-priority RISK — reduce (hurts liking, over-delivered here)' if row['Index'] > 100
+                    else f'🟦 {priority}-priority — fine as is (hurts liking, already under-delivered)')
+
+    out['Recommendation'] = out.apply(recommend, axis=1)
+    out = out.sort_values(by='Importance (%)', ascending=False).reset_index(drop=True)
+    out.insert(0, 'Product', product)
+    return out[['Product', 'Driver', 'Direction', 'Importance (%)', 'Whole-Sample Importance (%)',
+                'Product Mean', 'Rest-of-Set Mean', 'Index', 'p-value', 'q-value (BH)',
+                'Significant', 'Recommendation']]
+
+
+def recommendation_chart(reco_df, product_label):
+    """Drivers-of-liking bar chart in the style of the reference mock: bar = this product's
+    driver importance, grey tick = whole-sample importance for that driver, right-hand number
+    = index of this product's attribute score vs the rest of the set, ▲/▼ = BH-significant gap."""
+    n = len(reco_df)
+    plot_df = reco_df.sort_values(by='Importance (%)', ascending=True)
+    bar_colors = [share_strength_color(row['Importance (%)'], row['Direction'], n) for _, row in plot_df.iterrows()]
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=plot_df['Importance (%)'], y=plot_df['Driver'], orientation='h',
+        marker_color=bar_colors, name=str(product_label), width=0.5,
+        hovertemplate='%{y}<br>Importance (this product): %{x:.1f}%<extra></extra>'
+    ))
+    fig.add_trace(go.Scatter(
+        x=plot_df['Whole-Sample Importance (%)'], y=plot_df['Driver'], mode='markers',
+        marker=dict(symbol='line-ns', size=18, line=dict(width=2, color='#4a4a4a')),
+        name='Whole sample', hovertemplate='Whole-sample importance: %{x:.1f}%<extra></extra>'
+    ))
+    x_max = max(plot_df['Importance (%)'].max(), plot_df['Whole-Sample Importance (%)'].max(skipna=True) or 0, 1)
+    for _, row in plot_df.iterrows():
+        idx, sig = row['Index'], row['Significant']
+        if pd.isna(idx):
+            label, color = 'n/a', '#8993A1'
+        else:
+            arrow = '▲' if (sig and idx > 100) else '▼' if (sig and idx < 100) else ''
+            label = f"{idx:.0f}%  {arrow}".strip()
+            color = '#16845B' if arrow == '▲' else '#CC3975' if arrow == '▼' else '#666666'
+        fig.add_annotation(x=x_max * 1.06, y=row['Driver'], text=f"<b>{label}</b>", showarrow=False,
+                            xanchor='left', font=dict(color=color, size=13))
+    fig.update_layout(
+        title=f"Drivers of Liking — {product_label}", height=max(320, 42 * n),
+        xaxis_title='Importance (%)', margin=dict(r=110, l=10, t=60, b=40),
+        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1))
+    return fig
 
 
 def calc_cata_penalty(tab_df, target, features, cata_format="0/1", reach_threshold=20):
@@ -761,12 +889,6 @@ def product_filter_ui(working_df, product_col, key_prefix):
 
 st.title("📊 Consumer Driver Analysis Suite")
 
-with st.sidebar.expander("Chart display", expanded=False):
-    st.slider("Maximum chart height (pixels)", min_value=350, max_value=1600,
-              value=600, step=50, key="chart_max_height",
-              help="Use a smaller height on laptop screens. Increase it for charts with many labels.")
-    st.caption("Mouse-wheel chart zoom is disabled to reduce conflicts with page scrolling. Use the chart toolbar for zoom controls where available.")
-
 uploaded_file = st.file_uploader("Upload Excel File", type="xlsx")
 
 if uploaded_file:
@@ -940,7 +1062,7 @@ if uploaded_file:
     analysis_options = [
         "Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)",
         "JAR Penalty Analysis", "Kano Analysis", "Path Analysis",
-        "Mixed-Effects Model", "Preference Mapping"
+        "Mixed-Effects Model", "Preference Mapping", "Product Recommendations"
     ]
     analysis_types = st.sidebar.multiselect("Choose Analyses", analysis_options, default=[], placeholder="Choose options...")
 
@@ -1423,7 +1545,7 @@ if uploaded_file:
                                         key=f"path_neutral_{path_signature}_{coefficient_column}",
                                         help="Grey indicates near-zero magnitude, not statistical nonsignificance. The threshold uses the selected coefficient scale.")
                                     fig = path_diagram(paths, outcome, coefficient_column, product_choice, neutral_threshold)
-                                    render_chart(fig, use_container_width=True,
+                                    st.plotly_chart(fig, use_container_width=True,
                                         config={'displaylogo': False, 'toImageButtonOptions': {'format': 'svg', 'filename': 'path_analysis'}})
                                     st.caption("Green = positive · Pink = negative · Grey = within the neutral band. Ribbon width represents the absolute coefficient, not a flow volume. Signed coefficients appear beside each attribute; hover for p-values. Exactly zero effects have no ribbon. Colour does not indicate statistical significance.")
                                     if len(outcomes) > 1:
@@ -1571,6 +1693,85 @@ if uploaded_file:
                             st.dataframe(scores_df, use_container_width=True)
                             results_to_export["PrefMap_Scores"] = scores_df
                             results_to_export["PrefMap_Loadings"] = loadings_df
+
+                elif analysis == "Product Recommendations":
+                    st.subheader("📌 Product Recommendations — Drivers × Performance")
+                    st.caption(
+                        "For each product, crosses driver importance (recomputed on that product's own respondents) "
+                        "against how the product over/under-indexes on each attribute vs the rest of the set, "
+                        "to turn every driver into a concrete increase / maintain / reduce recommendation."
+                    )
+                    if product_col == "None":
+                        st.warning("⚠️ Set a **Product ID column** in the sidebar → Step 1 to use this module — "
+                                    "it needs to know which rows belong to which product to compare one against the rest.")
+                    else:
+                        c1, c2 = st.columns(2)
+                        with c1:
+                            reco_method = st.selectbox(
+                                "Importance method (recomputed per product)",
+                                ["Shapley Values", "RWA", "Standardized Regression"], key="reco_method"
+                            )
+                        with c2:
+                            reco_alpha = st.number_input(
+                                "Significance threshold (BH-adjusted α)", 0.01, 0.20, 0.05, step=0.01, key="reco_alpha"
+                            )
+
+                        all_products = sorted(working_df[product_col].dropna().astype(str).unique().tolist())
+                        if len(all_products) < 2:
+                            st.warning("Need at least 2 products in the current sample to compare one against 'the rest of the set'.")
+                        else:
+                            focus_product = st.selectbox("Focus product", all_products, key="reco_focus_product")
+                            reco_df = calc_product_recommendations(
+                                working_df, product_col, focus_product, target, features,
+                                method=reco_method, alpha=reco_alpha
+                            )
+                            if reco_df is None:
+                                st.warning(f"⚠️ Not enough data for '{focus_product}' (or the rest of the set) to run this analysis.")
+                            else:
+                                display_plot(recommendation_chart(reco_df, focus_product), use_container_width=True)
+                                st.caption(
+                                    "🟩/🟥 bar = this product's driver importance (colored by whether the driver helps or hurts "
+                                    "liking). Grey tick = whole-sample importance for that driver. Right-hand number = index of "
+                                    "this product's average score on that attribute vs the rest of the set (100 = same as the "
+                                    "rest). ▲▼ = the gap is significant after Benjamini-Hochberg correction."
+                                )
+                                reco_display = reco_df.drop(columns=['Product']).copy()
+                                for col in ('Importance (%)', 'Whole-Sample Importance (%)', 'Product Mean', 'Rest-of-Set Mean', 'Index'):
+                                    reco_display[col] = reco_display[col].round(2)
+                                reco_display['p-value'] = reco_display['p-value'].map(lambda v: f'{v:.4g}' if pd.notna(v) else '')
+                                reco_display['q-value (BH)'] = reco_display['q-value (BH)'].map(lambda v: f'{v:.4g}' if pd.notna(v) else '')
+                                model_summary(reco_display, note=f"N (this product) vs N (rest of set) — one row per driver, for {focus_product}.")
+                                results_to_export[f"Reco_{sanitize_name(focus_product)}"] = reco_df
+
+                            st.divider()
+                            st.markdown("**Full report — every product**")
+                            if st.button("📋 Generate recommendations for ALL products", key="reco_all_btn"):
+                                with st.spinner(f"Running recommendations for {len(all_products)} products..."):
+                                    all_reco = [r for p in all_products
+                                                if (r := calc_product_recommendations(
+                                                        working_df, product_col, p, target, features,
+                                                        method=reco_method, alpha=reco_alpha)) is not None]
+                                st.session_state['reco_full_table'] = pd.concat(all_reco, ignore_index=True) if all_reco else None
+
+                            full_reco = st.session_state.get('reco_full_table')
+                            if full_reco is not None:
+                                st.markdown("#### Executive summary — top opportunity / strength / risk per product")
+                                summary_rows = []
+                                for p, grp in full_reco.groupby('Product'):
+                                    opp = grp[grp['Recommendation'].str.contains('OPPORTUNITY', na=False)].sort_values('Importance (%)', ascending=False)
+                                    strength = grp[grp['Recommendation'].str.contains('STRENGTH', na=False)].sort_values('Importance (%)', ascending=False)
+                                    risk = grp[grp['Recommendation'].str.contains('RISK', na=False)].sort_values('Importance (%)', ascending=False)
+                                    fmt = lambda d: f"{display_label(d.iloc[0]['Driver'])} (idx {d.iloc[0]['Index']:.0f})" if not d.empty else "—"
+                                    summary_rows.append({'Product': p, 'Top Opportunity (increase)': fmt(opp),
+                                                          'Top Strength (maintain)': fmt(strength), 'Top Risk (reduce)': fmt(risk)})
+                                summary_df = pd.DataFrame(summary_rows)
+                                st.dataframe(summary_df, hide_index=True, use_container_width=True)
+                                with st.expander("Full driver-by-driver table, all products"):
+                                    st.dataframe(display_table(full_reco), hide_index=True, use_container_width=True)
+                                results_to_export["Reco_AllProducts"] = full_reco
+                                results_to_export["Reco_ExecSummary"] = summary_df
+                            elif full_reco is None and "reco_full_table" in st.session_state:
+                                st.warning("No product had enough data (on both sides of the split) to compute recommendations.")
 
         with tabs[-1]:
             st.subheader("Download Results")
