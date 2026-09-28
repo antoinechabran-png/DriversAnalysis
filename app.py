@@ -424,10 +424,15 @@ def calc_driver_importance(tab_df, target, features, method="Shapley Values"):
 
 def calc_product_recommendations(working_df, product_col, product, target, features,
                                    method="Shapley Values", alpha=0.05, min_n=5,
-                                   importance_scope="Total Set"):
+                                   importance_scope="Total Set", benchmark_product=None):
     """Crosses driver importance against how the product over/under-indexes on each attribute
-    vs the rest of the product set, to turn every driver into a concrete increase / maintain /
-    reduce recommendation.
+    vs a benchmark, to turn every driver into a concrete increase / maintain / reduce
+    recommendation.
+
+    - Benchmark: by default (benchmark_product=None) the mean of every OTHER product's
+      respondents ("Rest of Set"). If benchmark_product is given, the benchmark is instead
+      that one target product's respondents only, so the recommendation reads "what would it
+      take for this product to match / beat the target".
 
     - Importance & Direction: from `method`, and from `importance_scope`:
         "Total Set"    — importance/direction estimated once on the WHOLE sample (all products
@@ -438,15 +443,21 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
         "Product Itself" — importance/direction re-estimated on THIS product's own respondents
                          only ("intra" drivers) — what matters for liking within this product
                          specifically, which can differ from what matters across the set.
-    - Index: this product's mean on the attribute vs the mean of every OTHER product's
-      respondents (100 = same as the rest of the set).
+    - Index: this product's mean on the attribute vs the benchmark mean (100 = same as benchmark).
     - Significance: Welch's t-test per driver, Benjamini-Hochberg corrected across drivers.
 
     Returns None when there isn't enough data (either side of the split) to run it.
     """
     prod_mask = working_df[product_col].astype(str) == str(product)
     prod_df = working_df.loc[prod_mask]
-    rest_df = working_df.loc[~prod_mask]
+    if benchmark_product is None:
+        rest_df = working_df.loc[~prod_mask]
+        benchmark_label = "Rest of Set"
+    else:
+        if str(benchmark_product) == str(product):
+            return None
+        rest_df = working_df.loc[working_df[product_col].astype(str) == str(benchmark_product)]
+        benchmark_label = str(benchmark_product)
     if len(prod_df) < min_n or len(rest_df) < min_n:
         return None
 
@@ -465,14 +476,14 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
         f_min, f_max = (all_vals.min(), all_vals.max()) if not all_vals.empty else (np.nan, np.nan)
         if len(p_vals) < 2 or len(r_vals) < 2:
             pvals.append(np.nan)
-            rows.append({'Driver': feat, 'Product Mean': np.nan, 'Rest-of-Set Mean': np.nan, 'Index': np.nan,
+            rows.append({'Driver': feat, 'Product Mean': np.nan, 'Benchmark Mean': np.nan, 'Index': np.nan,
                          'Feature Min': f_min, 'Feature Max': f_max})
             continue
         p_mean, r_mean = p_vals.mean(), r_vals.mean()
         _, pval = stats.ttest_ind(p_vals, r_vals, equal_var=False)
         pvals.append(pval)
         index_val = np.nan if (pd.isna(r_mean) or r_mean == 0) else (p_mean / r_mean * 100)
-        rows.append({'Driver': feat, 'Product Mean': p_mean, 'Rest-of-Set Mean': r_mean, 'Index': index_val,
+        rows.append({'Driver': feat, 'Product Mean': p_mean, 'Benchmark Mean': r_mean, 'Index': index_val,
                      'Feature Min': f_min, 'Feature Max': f_max})
     gap_df = pd.DataFrame(rows)
 
@@ -488,8 +499,9 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
 
     out = importance_used.merge(gap_df, on='Driver', how='left')
     out['Importance Scope'] = importance_scope
+    out['Benchmark'] = benchmark_label
     out['Importance (%) — Other Scope'] = out['Driver'].map(other_scope_tick)
-    out['Gap (Product − Rest of Set)'] = out['Product Mean'] - out['Rest-of-Set Mean']
+    out['Gap (Product − Benchmark)'] = out['Product Mean'] - out['Benchmark Mean']
     equal_share = 100.0 / max(len(features), 1)
     out['Priority'] = np.select(
         [out['Importance (%)'] >= 1.5 * equal_share, out['Importance (%)'] >= 0.5 * equal_share],
@@ -510,7 +522,7 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
         if pd.isna(row['Index']) or pd.isna(row['Significant']):
             return '⚪ Insufficient data'
         if not row['Significant']:
-            return f"⚪ {row['Priority']}-importance — no significant gap vs rest of set"
+            return f"⚪ {row['Priority']}-importance — no significant gap vs benchmark"
         if row['Direction'] == 'Positive':
             return (f"🟢 {row['Priority']}-priority OPPORTUNITY — increase (helps liking, under-delivered here)" if row['Index'] < 100
                     else f"✅ {row['Priority']}-priority STRENGTH — maintain / lead with it (helps liking, over-delivered)")
@@ -522,12 +534,12 @@ def calc_product_recommendations(working_df, product_col, product, target, featu
     out['Recommendation'] = out.apply(recommend, axis=1)
     priority_rank = out['Priority'].map({'High': 3, 'Medium': 2, 'Low': 1})
     out = out.assign(_rank=priority_rank, _sig=out['Significant'].fillna(False).astype(int),
-                      _gap=out['Gap (Product − Rest of Set)'].abs()).sort_values(
+                      _gap=out['Gap (Product − Benchmark)'].abs()).sort_values(
         by=['_rank', '_sig', '_gap'], ascending=[False, False, False]).drop(columns=['_rank', '_sig', '_gap']).reset_index(drop=True)
     out.insert(0, 'Product', product)
-    return out[['Product', 'Driver', 'Direction', 'Importance Scope', 'Importance (%)', 'Priority',
-                'Importance (%) — Other Scope', 'Product Mean', 'Rest-of-Set Mean',
-                'Gap (Product − Rest of Set)', 'Feature Min', 'Feature Max',
+    return out[['Product', 'Benchmark', 'Driver', 'Direction', 'Importance Scope', 'Importance (%)', 'Priority',
+                'Importance (%) — Other Scope', 'Product Mean', 'Benchmark Mean',
+                'Gap (Product − Benchmark)', 'Feature Min', 'Feature Max',
                 'Index', 'p-value', 'q-value (BH)', 'Significant', 'Action', 'Recommendation']]
 
 
@@ -543,6 +555,7 @@ def recommendation_chart(reco_df, product_label, min_gap_frac=0.045):
     so both stay distinguishable instead of overlapping."""
     n = len(reco_df)
     plot_df = reco_df.sort_values(by='Importance (%)', ascending=True).reset_index(drop=True)
+    bench_label = plot_df['Benchmark'].iloc[0] if 'Benchmark' in plot_df.columns and n else 'Rest of Set'
     bar_colors = [share_strength_color(row['Importance (%)'], row['Direction'], n) for _, row in plot_df.iterrows()]
     x_max = max(plot_df['Importance (%)'].max(), 1)
     min_gap = min_gap_frac * x_max
@@ -551,9 +564,9 @@ def recommendation_chart(reco_df, product_label, min_gap_frac=0.045):
     for _, row in plot_df.iterrows():
         f_min, f_max = row['Feature Min'], row['Feature Max']
         span = (f_max - f_min) if pd.notna(f_max) and pd.notna(f_min) and (f_max - f_min) > 0 else np.nan
-        if pd.isna(span) or pd.isna(row['Rest-of-Set Mean']) or pd.isna(row['Product Mean']):
+        if pd.isna(span) or pd.isna(row['Benchmark Mean']) or pd.isna(row['Product Mean']):
             mean_x.append(np.nan); cand_x.append(np.nan); drivers.append(row['Driver']); continue
-        m = np.clip((row['Rest-of-Set Mean'] - f_min) / span, 0, 1) * x_max
+        m = np.clip((row['Benchmark Mean'] - f_min) / span, 0, 1) * x_max
         c = np.clip((row['Product Mean'] - f_min) / span, 0, 1) * x_max
         diff = c - m
         if abs(diff) < min_gap:
@@ -571,10 +584,10 @@ def recommendation_chart(reco_df, product_label, min_gap_frac=0.045):
         hovertemplate='%{y}<br>Importance: %{x:.1f}%<extra></extra>'
     ))
     fig.add_trace(go.Scatter(
-        x=mean_x, y=drivers, mode='markers', name='Rest of set (mean)',
+        x=mean_x, y=drivers, mode='markers', name=(f'Benchmark: {bench_label}' if bench_label != 'Rest of Set' else 'Rest of set (mean)'),
         marker=dict(symbol='line-ns', size=20, line=dict(width=3, color='#333333')),
-        customdata=plot_df['Rest-of-Set Mean'],
-        hovertemplate='%{y}<br>Rest-of-set mean score: %{customdata:.2f}<extra></extra>'
+        customdata=plot_df['Benchmark Mean'],
+        hovertemplate='%{y}<br>' + str(bench_label) + ' mean score: %{customdata:.2f}<extra></extra>'
     ))
     fig.add_trace(go.Scatter(
         x=cand_x, y=drivers, mode='markers', name=str(product_label),
@@ -1798,39 +1811,57 @@ if uploaded_file:
 
                         all_products = sorted(working_df[product_col].dropna().astype(str).unique().tolist())
                         if len(all_products) < 2:
-                            st.warning("Need at least 2 products in the current sample to compare one against 'the rest of the set'.")
+                            st.warning("Need at least 2 products in the current sample to compare one against a benchmark.")
                         else:
-                            focus_product = st.selectbox("Focus product", all_products, key="reco_focus_product")
+                            b1, b2, b3 = st.columns(3)
+                            with b1:
+                                reco_bench_mode = st.selectbox(
+                                    "Compare against", ["Rest of Set", "A target product"], key="reco_bench_mode",
+                                    help="Rest of Set (default): the benchmark is the mean of every other product's "
+                                         "respondents. A target product: the benchmark (dark tick, gaps, significance "
+                                         "tests and recommendations) becomes that one product only — e.g. 'what would "
+                                         "it take for my candidate to match the market leader?'"
+                                )
+                            with b2:
+                                focus_product = st.selectbox("Focus product", all_products, key="reco_focus_product")
+                            reco_bench_product = None
+                            with b3:
+                                if reco_bench_mode == "A target product":
+                                    bench_options = [p for p in all_products if p != focus_product]
+                                    reco_bench_product = st.selectbox("Target product (benchmark)", bench_options, key="reco_bench_product")
+                            bench_txt = f"target product **{reco_bench_product}**" if reco_bench_product else "the **rest of the set**"
+                            st.caption(f"Benchmark currently: {bench_txt}. Gaps, significance tests and actions below are all measured against it.")
                             reco_df = calc_product_recommendations(
                                 working_df, product_col, focus_product, target, features,
-                                method=reco_method, alpha=reco_alpha, importance_scope=reco_scope
+                                method=reco_method, alpha=reco_alpha, importance_scope=reco_scope,
+                                benchmark_product=reco_bench_product
                             )
                             if reco_df is None:
-                                st.warning(f"⚠️ Not enough data for '{focus_product}' (or the rest of the set) to run this analysis.")
+                                st.warning(f"⚠️ Not enough data for '{focus_product}' (or the benchmark) to run this analysis.")
                             else:
                                 display_plot(recommendation_chart(reco_df, focus_product), use_container_width=True)
                                 st.caption(
                                     "Bar length = this product's driver importance (green = helps liking, red = hurts liking; "
-                                    "darker = more important). The two ticks on each bar show where the **rest-of-set mean** "
-                                    "(dark tick) and **this product** (orange tick) sit on that attribute's own scale — rescaled "
+                                    "darker = more important). The two ticks on each bar show where the **benchmark mean** "
+                                    "(dark tick — rest of set, or your target product) and **this product** (orange tick) sit on that attribute's own scale — rescaled "
                                     "row-by-row so they're readable, and nudged apart automatically if they'd otherwise overlap. "
                                     "▲▼ marks a gap that survives Benjamini-Hochberg correction. Hover a tick for the exact score."
                                 )
 
                                 st.markdown(f"##### Recommended actions — {focus_product}")
-                                st.caption("Ranked by priority (driver importance), then by how far the product sits from the rest-of-set mean.")
+                                st.caption("Ranked by priority (driver importance), then by how far the product sits from the benchmark mean.")
                                 action_cols = ['Driver', 'Direction', 'Priority', 'Importance (%)',
-                                               'Product Mean', 'Rest-of-Set Mean', 'Gap (Product − Rest of Set)',
+                                               'Product Mean', 'Benchmark Mean', 'Gap (Product − Benchmark)',
                                                'Significant', 'Action']
                                 action_table = reco_df[action_cols].copy()
-                                for col in ('Importance (%)', 'Product Mean', 'Rest-of-Set Mean', 'Gap (Product − Rest of Set)'):
+                                for col in ('Importance (%)', 'Product Mean', 'Benchmark Mean', 'Gap (Product − Benchmark)'):
                                     action_table[col] = action_table[col].round(2)
                                 st.dataframe(display_table(action_table), hide_index=True, use_container_width=True)
 
                                 with st.expander("Full statistical detail (p-values, index, BH q-values)"):
                                     reco_display = reco_df.drop(columns=['Product']).copy()
                                     for col in ('Importance (%)', 'Importance (%) — Other Scope', 'Product Mean',
-                                                'Rest-of-Set Mean', 'Gap (Product − Rest of Set)', 'Index'):
+                                                'Benchmark Mean', 'Gap (Product − Benchmark)', 'Index'):
                                         reco_display[col] = reco_display[col].round(2)
                                     reco_display['p-value'] = reco_display['p-value'].map(lambda v: f'{v:.4g}' if pd.notna(v) else '')
                                     reco_display['q-value (BH)'] = reco_display['q-value (BH)'].map(lambda v: f'{v:.4g}' if pd.notna(v) else '')
@@ -1845,7 +1876,8 @@ if uploaded_file:
                                                 if (r := calc_product_recommendations(
                                                         working_df, product_col, p, target, features,
                                                         method=reco_method, alpha=reco_alpha,
-                                                        importance_scope=reco_scope)) is not None]
+                                                        importance_scope=reco_scope,
+                                                        benchmark_product=reco_bench_product)) is not None]
                                 st.session_state['reco_full_table'] = pd.concat(all_reco, ignore_index=True) if all_reco else None
 
                             full_reco = st.session_state.get('reco_full_table')
@@ -1856,7 +1888,7 @@ if uploaded_file:
                                     inc = grp[grp['Action'].str.contains('Increase', na=False)].sort_values('Importance (%)', ascending=False)
                                     dec = grp[grp['Action'].str.contains('Decrease', na=False)].sort_values('Importance (%)', ascending=False)
                                     maint = grp[grp['Action'].str.contains('Maintain', na=False)].sort_values('Importance (%)', ascending=False)
-                                    fmt = lambda d: f"{display_label(d.iloc[0]['Driver'])} ({d.iloc[0]['Gap (Product − Rest of Set)']:+.2f} vs set)" if not d.empty else "—"
+                                    fmt = lambda d: f"{display_label(d.iloc[0]['Driver'])} ({d.iloc[0]['Gap (Product − Benchmark)']:+.2f} vs benchmark)" if not d.empty else "—"
                                     summary_rows.append({'Product': p, 'Top thing to Increase': fmt(inc),
                                                           'Top thing to Decrease': fmt(dec), 'Top Strength to Maintain': fmt(maint)})
                                 summary_df = pd.DataFrame(summary_rows)
