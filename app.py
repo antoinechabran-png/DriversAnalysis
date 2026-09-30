@@ -849,6 +849,9 @@ def _pptx_add_bar_chart(slide, df, driver_col, value_col, n_drivers=None,
     chart.has_legend = False
     chart.has_title = False
     auto_title = OxmlElement('c:autoTitleDeleted')
+    # The library's chart template already contains this singleton element.
+    # Reuse it; inserting a second one makes PowerPoint repair the chart.
+    auto_title = chart._chartSpace.chart.get_or_add_autoTitleDeleted()
     auto_title.set('val', '1')
     chart._chartSpace.chart.insert(0, auto_title)
     # Some python-pptx versions emit signed IDs, although OOXML requires uint32.
@@ -885,6 +888,8 @@ def _pptx_add_bar_chart(slide, df, driver_col, value_col, n_drivers=None,
         element = OxmlElement('c:' + tag)
         element.set('val', '1')
         category_axis._element.append(element)
+        # OOXML requires both skip settings before noMultiLvlLbl/extLst.
+        category_axis._element.insert_element_before(element, 'c:noMultiLvlLbl', 'c:extLst')
     value_axis = chart.value_axis
     value_axis.tick_labels.font.name = 'Arial'
     value_axis.tick_labels.font.size = Pt(12)
@@ -1288,8 +1293,11 @@ if uploaded_file:
     st.sidebar.header("2. Analysis Selection")
     analysis_options = [
         "Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)",
+    analysis_options = [
+        "Product Recommendations", "Linear Regression", "RWA", "Shapley Values", "Penalty Analysis (CATA)",
         "JAR Penalty Analysis", "Kano Analysis", "Path Analysis",
         "Mixed-Effects Model", "Preference Mapping", "Product Recommendations"
+        "Mixed-Effects Model", "Preference Mapping"
     ]
     analysis_types = st.sidebar.multiselect("Choose Analyses", analysis_options, default=[], placeholder="Choose options...")
 
