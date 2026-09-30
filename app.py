@@ -20,9 +20,10 @@ try:
     from pptx import Presentation
     from pptx.util import Inches, Pt, Emu
     from pptx.chart.data import CategoryChartData
-    from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+    from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION, XL_TICK_LABEL_POSITION, XL_LABEL_POSITION
+    from pptx.oxml.xmlchemy import OxmlElement
     from pptx.dml.color import RGBColor
-    from pptx.enum.text import PP_ALIGN
+    from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
     PPTX_AVAILABLE = True
 except ImportError:
     PPTX_AVAILABLE = False
@@ -771,19 +772,28 @@ def _pptx_add_title_slide(prs, title_text, subtitle_text):
     tf.text = title_text
     tf.paragraphs[0].font.size = Pt(40)
     tf.paragraphs[0].font.bold = True
-    sub = slide.shapes.add_textbox(Inches(0.8), Inches(3.8), Inches(11.7), Inches(0.8))
+    tf.paragraphs[0].font.name = 'Arial'
+    tf.paragraphs[0].font.color.rgb = RGBColor.from_string('172536')
+    sub = slide.shapes.add_textbox(Inches(0.8), Inches(3.8), Inches(11.7), Inches(1.8))
     stf = sub.text_frame
+    stf.word_wrap = True
     stf.text = subtitle_text
-    stf.paragraphs[0].font.size = Pt(18)
-    stf.paragraphs[0].font.color.rgb = RGBColor(0x60, 0x60, 0x60)
+    for p in stf.paragraphs:
+        p.font.name = 'Arial'
+        p.font.size = Pt(18)
+        p.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
     return slide
 
 
 def _pptx_add_header(slide, analysis_name, scope_label, n):
     box = slide.shapes.add_textbox(Inches(0.5), Inches(0.3), Inches(12.3), Inches(0.9))
+    slide.background.fill.solid()
+    slide.background.fill.fore_color.rgb = RGBColor(255, 255, 255)
     tf = box.text_frame
     tf.word_wrap = True
     p = tf.paragraphs[0]
+    p.font.name = 'Arial'
+    p.font.color.rgb = RGBColor.from_string('172536')
     p.text = analysis_name
     p.font.size = Pt(26)
     p.font.bold = True
@@ -793,20 +803,156 @@ def _pptx_add_header(slide, analysis_name, scope_label, n):
     p2.font.color.rgb = RGBColor(0x60, 0x60, 0x60)
 
 
-def _pptx_add_bar_chart(slide, df, driver_col, value_col):
-    df = display_table(df).sort_values(by=value_col, ascending=True)  # ascending so biggest bar ends up on top
+def _pptx_label(value):
+    # Wrap the app's display label without dropping any words or variable codes.
+    wrapper = textwrap.TextWrapper(width=48, break_long_words=True, break_on_hyphens=False)
+    # Raw survey codes use underscores. Prefer breaking there instead of in a word.
+    wrapper.wordsep_re = re.compile(r'(\s+|(?<=_))')
+    wrapper.wordsep_simple_re = wrapper.wordsep_re
+    return '\n'.join(wrapper.wrap(str(display_label(value))))
+
+
+def _pptx_driver_pages(df, driver_col, max_rows=12):
+    """Keep enough room for every label, including long multi-line labels."""
+    pages, start, lines, longest = [], 0, 0, 0
+    for i, value in enumerate(df[driver_col]):
+        cost = max(1, len(_pptx_label(value).splitlines()))
+        if i > start and (i - start >= max_rows or lines + cost > 20
+                          or max(longest, cost) * (i - start + 1) > 24):
+            pages.append(df.iloc[start:i])
+            start, lines, longest = i, 0, 0
+        lines += cost
+        longest = max(longest, cost)
+    if start < len(df):
+        pages.append(df.iloc[start:])
+    return pages
+
+
+def _pptx_add_bar_chart(slide, df, driver_col, value_col, n_drivers=None,
+                        axis_bounds=None):
+    # Keep the same bottom-to-top category order as the app's horizontal bars.
+    # Pagination happens before this call, but colors use the FULL driver count.
+    n_drivers = n_drivers or len(df)
+    dense = len(df) > 12
+    row_height = 5.15 * 0.86 / len(df)
+    labels = [str(display_label(v)) if dense else _pptx_label(v) for v in df[driver_col]]
+    label_font = min(12.0, row_height * 72 * 0.80)
+    if dense:
+        # Reserve one line per driver. Fit full labels, never truncate or skip them.
+        label_font = min(label_font, (4.85 * 72 - 15) / (0.65 * max(map(len, labels), default=1)))
     chart_data = CategoryChartData()
-    chart_data.categories = df[driver_col].astype(str).tolist()
-    chart_data.add_series(value_col, df[value_col].round(3).tolist())
-    x, y, cx, cy = Inches(0.6), Inches(1.4), Inches(12.1), Inches(5.7)
-    gframe = slide.shapes.add_chart(XL_CHART_TYPE.BAR_CLUSTERED, x, y, cx, cy, chart_data)
-    chart = gframe.chart
+    chart_data.categories = [_pptx_label(v) for v in df[driver_col]]
+    chart_data.add_series(value_col, df[value_col].astype(float).tolist())
+    chart = slide.shapes.add_chart(
+        XL_CHART_TYPE.BAR_CLUSTERED, Inches(0.45), Inches(1.55),
+        Inches(12.35), Inches(5.15), chart_data).chart
     chart.has_legend = False
+    chart.has_title = False
+    auto_title = OxmlElement('c:autoTitleDeleted')
+    auto_title.set('val', '1')
+    chart._chartSpace.chart.insert(0, auto_title)
+    # Some python-pptx versions emit signed IDs, although OOXML requires uint32.
+    for element in chart._chartSpace.iter():
+        if element.tag.rsplit('}', 1)[-1] in ('axId', 'crossAx'):
+            element.set('val', str(int(element.get('val')) % (2 ** 32)))
+    chart.font.name = 'Arial'
+    chart.font.size = Pt(14)
+    chart.font.color.rgb = RGBColor.from_string('172536')
     plot = chart.plots[0]
+    plot.gap_width = 30 if dense else 45
     plot.has_data_labels = True
-    plot.data_labels.number_format = '0.0'
+    plot.data_labels.position = XL_LABEL_POSITION.OUTSIDE_END
+    plot.data_labels.number_format = '0.000' if '%' not in value_col else '0.0"%"'
     plot.data_labels.number_format_is_linked = False
-    plot.data_labels.font.size = Pt(11)
+    plot.data_labels.font.name = 'Arial'
+    plot.data_labels.font.size = Pt(min(12.0, row_height * 72 * 0.80))
+    colors = ([share_strength_color(row[value_col], row['Direction'], n_drivers)
+               for _, row in df.iterrows()] if 'Direction' in df.columns
+              else [signed_strength_color(v) for v in df[value_col]])
+    for point, color in zip(chart.series[0].points, colors):
+        point.format.fill.solid()
+        point.format.fill.fore_color.rgb = RGBColor.from_string(color.lstrip('#'))
+        point.format.line.fill.background()
+    category_axis = chart.category_axis
+    # Native axis labels can move to zero or lose wrapping in PPT renderers.
+    # Editable text boxes give each category a guaranteed, fixed label slot.
+    category_axis.tick_label_position = XL_TICK_LABEL_POSITION.NONE
+    category_axis.tick_labels.font.name = 'Arial'
+    category_axis.tick_labels.font.size = Pt(14)
+    category_axis.format.line.fill.background()
+    # PowerPoint otherwise auto-skips labels (30 bars can show just 10 labels).
+    for tag in ('tickLblSkip', 'tickMarkSkip'):
+        element = OxmlElement('c:' + tag)
+        element.set('val', '1')
+        category_axis._element.append(element)
+    value_axis = chart.value_axis
+    value_axis.tick_labels.font.name = 'Arial'
+    value_axis.tick_labels.font.size = Pt(12)
+    value_axis.tick_labels.number_format = '0.00' if '%' not in value_col else '0"%"'
+    value_axis.has_major_gridlines = True
+    value_axis.major_gridlines.format.line.color.rgb = RGBColor.from_string('E6E9EF')
+    value_axis.format.line.fill.background()
+    value_axis.has_title = False
+    if axis_bounds is not None:
+        value_axis.minimum_scale, value_axis.maximum_scale = axis_bounds
+    # Reserve a fixed label column so labels don't shrink the chart unpredictably.
+    plot_area = chart._chartSpace.chart.plotArea
+    layout = plot_area.find('{http://schemas.openxmlformats.org/drawingml/2006/chart}layout')
+    if layout is None:
+        layout = OxmlElement('c:layout')
+        plot_area.insert(0, layout)
+    manual = OxmlElement('c:manualLayout')
+    for tag, value in [('layoutTarget', 'inner'), ('xMode', 'edge'),
+                       ('yMode', 'edge'), ('wMode', 'factor'), ('hMode', 'factor'),
+                       ('x', '0.43'), ('y', '0.02'), ('w', '0.52'), ('h', '0.86')]:
+        element = OxmlElement('c:' + tag)
+        element.set('val', value)
+        manual.append(element)
+    layout.append(manual)
+    for i, value in enumerate(df[driver_col]):
+        top = 1.55 + 5.15 * 0.02 + (len(df) - 1 - i) * row_height
+        label = slide.shapes.add_textbox(Inches(0.6), Inches(top),
+                                        Inches(4.85), Inches(row_height))
+        tf = label.text_frame
+        tf.word_wrap = not dense
+        tf.margin_top = tf.margin_bottom = 0
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        tf.text = labels[i]
+        for p in tf.paragraphs:
+            p.alignment = PP_ALIGN.RIGHT
+            p.font.name, p.font.size = 'Arial', Pt(label_font)
+            p.font.color.rgb = RGBColor.from_string('172536')
+    axis_label = slide.shapes.add_textbox(Inches(5.7), Inches(6.5), Inches(6.6), Inches(0.3))
+    axis_label.text_frame.text = value_col
+    axis_label.text_frame.paragraphs[0].alignment = PP_ALIGN.CENTER
+    axis_label.text_frame.paragraphs[0].font.name = 'Arial'
+    axis_label.text_frame.paragraphs[0].font.size = Pt(12)
+    caption = slide.shapes.add_textbox(Inches(0.6), Inches(6.95), Inches(12.1), Inches(0.4))
+    caption.text_frame.text = ('Green = positive   Red = negative   Gray = negligible   '
+                              'Darker shade = stronger effect')
+    p = caption.text_frame.paragraphs[0]
+    p.font.name, p.font.size = 'Arial', Pt(12)
+    p.font.color.rgb = RGBColor.from_string('606060')
+
+
+def _pptx_add_driver_slides(prs, first_slide, analysis, scope_label, n,
+                            result_df, driver_col, value_col, max_rows=None):
+    pages = [result_df] if max_rows is None else _pptx_driver_pages(result_df, driver_col, max_rows)
+    values = result_df[value_col].astype(float)
+    low, high = min(0.0, values.min()), max(0.0, values.max())
+    pad = (high - low or 1.0) * 0.15
+    bounds = (low - pad if low < 0 else 0.0, high + pad)
+    offset = 0
+    for page_number, page in enumerate(pages, 1):
+        slide = first_slide if page_number == 1 else prs.slides.add_slide(prs.slide_layouts[6])
+        _pptx_add_header(slide, analysis, scope_label, n)
+        note = slide.shapes.add_textbox(Inches(0.6), Inches(1.2), Inches(12), Inches(0.3))
+        note.text_frame.text = (f'All {len(result_df)} drivers' if len(pages) == 1 else
+                               f'Drivers {offset + 1}–{offset + len(page)} of {len(result_df)}'
+                               f'    Page {page_number} of {len(pages)}')
+        note.text_frame.paragraphs[0].font.size = Pt(12)
+        _pptx_add_bar_chart(slide, page, driver_col, value_col, len(result_df), bounds)
+        offset += len(page)
 
 
 def _pptx_add_table(slide, df, max_rows=14):
@@ -848,16 +994,17 @@ def _pptx_add_empty_slide(prs, analysis_name, scope_label, message):
 
 
 def build_pptx(scopes, analysis_types, target, features, panelist_col,
-                cata_format, cata_reach, jar_attrs, jar_scale, jar_reach, sample_label):
+                cata_format, cata_reach, jar_attrs, jar_scale, jar_reach, sample_label, drivers_per_slide=None):
     """scopes: list of (scope_label, filtered_df) tuples — e.g.
     [("Total Sample", working_df), ("Product: Rose", df_rose), ("Age: 18-24", df_1824), ...]
-    One slide is produced per (analysis, scope) combination."""
+    Driver charts show all drivers together by default; splitting is optional."""
     prs = Presentation()
     prs.slide_width, prs.slide_height = PPTX_SLIDE_W, PPTX_SLIDE_H
 
     _pptx_add_title_slide(
         prs, "Driver Analysis Results",
-        f"{sample_label} — Target: {target} — {len(features)} drivers — {len(scopes)} scope(s) × {len(analysis_types)} analysis(es)"
+        f"{sample_label}\nTarget: {display_label(target)}\n"
+        f"{len(features)} drivers, {len(scopes)} scope(s), {len(analysis_types)} analysis(es)"
     )
 
     for analysis in analysis_types:
@@ -871,14 +1018,15 @@ def build_pptx(scopes, analysis_types, target, features, panelist_col,
                 else:
                     result_df = calc_fn(scope_df, target, features)
                 n = len(scope_df[[target] + features].dropna())
-                _pptx_add_header(slide, analysis, scope_label, n)
                 if result_df is None or result_df.empty:
+                    _pptx_add_header(slide, analysis, scope_label, n)
                     box = slide.shapes.add_textbox(Inches(0.6), Inches(3.2), Inches(12), Inches(1))
                     box.text_frame.text = "Not enough data for this scope to run this analysis."
                     box.text_frame.paragraphs[0].font.italic = True
                 else:
                     driver_col = 'Driver' if 'Driver' in result_df.columns else result_df.columns[0]
-                    _pptx_add_bar_chart(slide, result_df, driver_col, value_col)
+                    _pptx_add_driver_slides(prs, slide, analysis, scope_label, n,
+                                            result_df, driver_col, value_col, drivers_per_slide)
 
             elif analysis == "Penalty Analysis (CATA)":
                 result_df = calc_cata_penalty(scope_df, target, features, cata_format, cata_reach)
@@ -1918,7 +2066,19 @@ if uploaded_file:
             elif not analysis_types:
                 st.info("Choose at least one analysis in the sidebar (Step 2) to enable PowerPoint export.")
             else:
-                st.caption("Builds one slide per analysis × scope. **The Total Sample is always included.**")
+                st.caption("Uses the app’s driver colors and display labels. All drivers appear together on one chart by default. **The Total Sample is always included.**")
+
+                combine_drivers = st.checkbox("Keep all drivers on one chart", value=True,
+                                              key="ppt_combine_drivers")
+                drivers_per_slide = None
+                if combine_drivers:
+                    st.caption("Label and value text adjusts to fit every driver on the same slide.")
+                else:
+                    drivers_per_slide = st.select_slider(
+                        "Maximum drivers per chart slide", options=[6, 8, 10, 12, 15], value=12,
+                        key="ppt_drivers_per_slide",
+                        help="All drivers are exported. Long labels may require fewer drivers per slide."
+                    )
 
                 # --- Ask about a per-product sub-analysis ---
                 export_product_col = product_col
@@ -1959,7 +2119,9 @@ if uploaded_file:
 
                 n_scopes = 1 + len(export_products) + len(export_filter_codes)
                 st.caption(f"This will build **{n_scopes} scope(s) × {len(analysis_types)} analysis(es)** "
-                           f"= up to {n_scopes * len(analysis_types)} slides.")
+                           f"= {n_scopes * len(analysis_types)} analysis sections, plus a cover. "
+                           + ("All drivers share one chart per analysis and scope." if combine_drivers else
+                              "Charts may span multiple slides to show all labels."))
 
                 if st.button("📊 Generate PowerPoint", key="ppt_generate_btn"):
                     scopes = [("Total Sample", working_df)]
@@ -1968,7 +2130,7 @@ if uploaded_file:
                     for code in export_filter_codes:
                         scopes.append((f"{export_filter_col}: {code}", working_df[working_df[export_filter_col].astype(str) == code]))
 
-                    with st.spinner(f"Building up to {n_scopes * len(analysis_types)} slide(s)..."):
+                    with st.spinner("Building PowerPoint with all driver labels..."):
                         ppt_bytes = build_pptx(
                             scopes=scopes, analysis_types=analysis_types, target=target, features=features,
                             panelist_col=panelist_col,
@@ -1977,7 +2139,8 @@ if uploaded_file:
                             jar_attrs=st.session_state.get("jar_attrs", []),
                             jar_scale=st.session_state.get("jar_scale", "3-point (1=Too Weak, 2=JAR, 3=Too Strong)"),
                             jar_reach=st.session_state.get("jar_reach", 15),
-                            sample_label=f"Sub-Target: {filter_col}" if filter_col != "No Filter" else "Full Sample"
+                            sample_label=f"Sub-Target: {filter_col}" if filter_col != "No Filter" else "Full Sample",
+                            drivers_per_slide=drivers_per_slide
                         )
                     st.session_state["ppt_bytes"] = ppt_bytes
 
