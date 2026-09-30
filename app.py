@@ -853,14 +853,22 @@ def _pptx_add_bar_chart(slide, df, driver_col, value_col, n_drivers=None,
     auto_title = chart._chartSpace.chart.get_or_add_autoTitleDeleted()
     auto_title.set('val', '1')
     # Some python-pptx versions emit signed IDs, although OOXML requires uint32.
+    # Keep IDs positive and below 2**31. Larger uint32 IDs pass the XML schema
+    # but desktop PowerPoint can reject them. Remap references together.
+    axis_ids = {}
     for element in chart._chartSpace.iter():
         if element.tag.rsplit('}', 1)[-1] in ('axId', 'crossAx'):
             element.set('val', str(int(element.get('val')) % (2 ** 32)))
+            old_id = element.get('val')
+            axis_ids.setdefault(old_id, str(100000 + len(axis_ids)))
+            element.set('val', axis_ids[old_id])
     chart.font.name = 'Arial'
     chart.font.size = Pt(14)
     chart.font.color.rgb = RGBColor.from_string('172536')
     plot = chart.plots[0]
     plot.gap_width = 30 if dense else 45
+    # PowerPoint otherwise renders negative bars with an inverted (white) fill.
+    chart.series[0].invert_if_negative = False
     plot.has_data_labels = True
     plot.data_labels.position = XL_LABEL_POSITION.OUTSIDE_END
     plot.data_labels.number_format = '0.000' if '%' not in value_col else '0.0"%"'
@@ -874,6 +882,12 @@ def _pptx_add_bar_chart(slide, df, driver_col, value_col, n_drivers=None,
         point.format.fill.solid()
         point.format.fill.fore_color.rgb = RGBColor.from_string(color.lstrip('#'))
         point.format.line.fill.background()
+        point.format.line.fill.background()
+    # Per-point formatting also needs an explicit inversion flag in PowerPoint.
+    for point_xml in chart._chartSpace.xpath('.//c:dPt'):
+        invert = OxmlElement('c:invertIfNegative')
+        invert.set('val', '0')
+        point_xml.insert(1, invert)
     category_axis = chart.category_axis
     # Native axis labels can move to zero or lose wrapping in PPT renderers.
     # Editable text boxes give each category a guaranteed, fixed label slot.
